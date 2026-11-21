@@ -6,6 +6,8 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 
+mod vertex_stream;
+
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShadeMode {
     #[default]
@@ -931,9 +933,12 @@ struct MeshBuild {
 
 // decodes one meshlet geometry from physical buffer and appends it to mesh build
 fn append_meshlet_geom(p: &[u8], (vb_off, vb_size, mb_off, _mb_size): GeomRef, geom_id: u16, b: &mut MeshBuild) {
-    if mb_off + 0x10 > p.len() || vb_off + 0x80 > p.len() {
+    if mb_off + 0x10 > p.len() {
         return;
     }
+    let Some(vertex_end) = vb_off.checked_add(vb_size) else { return };
+    let Some(vertex_bytes) = p.get(vb_off..vertex_end) else { return };
+    let Ok(vertices) = vertex_stream::decode(vertex_bytes) else { return };
     let num_meshlets = (ru32(p, mb_off) & 0xFFFF) as usize;
     let tot_tris = ru32(p, mb_off + 4) as usize;
     let tot_vrefs = ru32(p, mb_off + 8) as usize;
@@ -946,46 +951,7 @@ fn append_meshlet_geom(p: &[u8], (vb_off, vb_size, mb_off, _mb_size): GeomRef, g
         return;
     }
 
-    let mut hdrs = [0u32; 8];
-    for (k, h) in hdrs.iter_mut().enumerate() {
-        if vb_off + k * 4 + 4 <= p.len() {
-            *h = ru32(p, vb_off + k * 4);
-        }
-    }
-    let stream0_off = ((hdrs[0] >> 8) << 1) as usize;
-    let mut stream0_end = vb_size;
-    let mut uv_stream_off: Option<usize> = None;
-    for &h in &hdrs[1..] {
-        if h == 0 { continue; }
-        let so = ((h >> 8) << 1) as usize;
-        let st = h & 0xff;
-        if so > stream0_off && so < stream0_end {
-            stream0_end = so;
-        }
-        if st == 0x28 && uv_stream_off.is_none() {
-            uv_stream_off = Some(so);
-        }
-    }
-    if vb_off + stream0_off >= p.len() {
-        return;
-    }
-    let max_vb_verts = ((stream0_end.saturating_sub(stream0_off)) / 8).min((p.len() - (vb_off + stream0_off)) / 8);
-    if max_vb_verts == 0 {
-        return;
-    }
-
-    let ox = rf32(p, vb_off + 0x60);
-    let oy = rf32(p, vb_off + 0x64);
-    let oz = rf32(p, vb_off + 0x68);
-    let sx = rf32(p, vb_off + 0x70);
-    let sy = rf32(p, vb_off + 0x74);
-    let sz = rf32(p, vb_off + 0x78);
-    // +0x6c picks which world axis sits in the 16 bit slot 0 is zyx 1 is zxy 2 is xyz
-    let slot_axis: [usize; 3] = match ru32(p, vb_off + 0x6c) {
-        0 => [2, 1, 0],
-        1 => [2, 0, 1],
-        _ => [0, 1, 2],
-    };
+    let max_vb_verts = vertices.positions.len();
 
     let base_v = b.verts.len() as u32;
     let mut max_v_used = 0usize;
@@ -1019,27 +985,11 @@ fn append_meshlet_geom(p: &[u8], (vb_off, vb_size, mb_off, _mb_size): GeomRef, g
         return;
     }
     let v_cnt = (max_v_used + 1).min(max_vb_verts);
-    let vbase = vb_off + stream0_off;
     b.verts.reserve(v_cnt);
     b.uvs.reserve(v_cnt);
     for i in 0..v_cnt {
-        let o = vbase + i * 8;
-        // packed rage9 24 bit xy and 16 bit z across 8 bytes
-        let ix = (p[o + 1] as u32) | ((p[o + 2] as u32) << 8) | ((p[o + 3] as u32) << 16);
-        let iy = (p[o] as u32) | ((p[o + 4] as u32) << 8) | ((p[o + 5] as u32) << 16);
-        let iz = (p[o + 6] as u32) | ((p[o + 7] as u32) << 8);
-        let slots = [ox + (ix as f32) * sx, oy + (iy as f32) * sy, oz + (iz as f32) * sz];
-        let mut pos = [0.0f32; 3];
-        for (slot, &axis) in slot_axis.iter().enumerate() {
-            pos[axis] = slots[slot];
-        }
-        b.verts.push(pos);
-        let uv = uv_stream_off
-            .map(|uvo| vb_off + uvo + i * 4)
-            .filter(|&u_pos| u_pos + 4 <= p.len())
-            .map(|u_pos| [ru16(p, u_pos) as f32 / 8192.0, ru16(p, u_pos + 2) as f32 / 8192.0])
-            .unwrap_or([0.0, 0.0]);
-        b.uvs.push(uv);
+        b.verts.push(vertices.positions[i]);
+        b.uvs.push(vertices.uvs.as_ref().map_or([0.0; 2], |uvs| uvs[i]));
     }
     b.tri_geom.resize(b.tri_geom.len() + added_tris, geom_id);
     b.meshlets += num_meshlets;
