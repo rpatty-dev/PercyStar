@@ -1,4 +1,5 @@
 ﻿mod anim;
+mod audio_player;
 mod awc;
 mod boot;
 mod dat;
@@ -474,7 +475,7 @@ struct ScanState {
 struct MediaState {
     loading: bool,
     status: String,
-    awc_streams: Vec<(u32, PathBuf)>,
+    loaded_tracks: Option<(Vec<audio_player::LoadedWavTrack>, Arc<Vec<u8>>)>,
     bink_child_pid: Option<u32>,
     bink_hwnd: Option<isize>,
     bink_clip: Option<PathBuf>,
@@ -668,10 +669,13 @@ struct Rpf9App {
     mv_hide_lods: bool,
     mv_entries: Vec<(usize, ModelCat, String)>,
     mv_counts: [usize; 10],
+    mv_video_count: usize,
     mv_ver: u64,
     mv_view: Vec<usize>,
     mv_view_key: Option<(u64, ModelCat, String, bool)>,
     mv_rng: u64,
+    audio_player: audio_player::AudioPlayerState,
+    explorer_scroll_to_sel: bool,
     // list ordering shared by explorer and model viewer
     sort_mode: SortMode,
     view_sort: SortMode,
@@ -790,6 +794,7 @@ impl Rpf9App {
             mv_hide_lods: true,
             mv_entries: Vec::new(),
             mv_counts: [0; 10],
+            mv_video_count: 0,
             mv_ver: u64::MAX,
             mv_view: Vec::new(),
             mv_view_key: None,
@@ -798,6 +803,8 @@ impl Rpf9App {
             mv_sort: SortMode::Relevance,
             world_map: worldmap::WorldMapState::default(),
             mv_rng: 0x9E37_79B9_7F4A_7C15,
+            audio_player: audio_player::AudioPlayerState::default(),
+            explorer_scroll_to_sel: false,
             sh_cache: None,
             sh_status: String::new(),
             sh_stage_filter: None,
@@ -848,13 +855,32 @@ impl Rpf9App {
         self.tex_handle = None;
         self.tex_zoom = 1.0;
         stop_wav();
+        self.audio_player.clear_all();
         self.stop_bink_player();
         let mut m = self.media.lock().unwrap();
-        m.awc_streams.clear();
+        m.loaded_tracks = None;
         m.status.clear();
         m.loading = false;
         m.loaded_mesh = None;
         m.loaded_textures = None;
+    }
+
+    fn browse_videos(&mut self) {
+        self.reset_selection();
+        self.tab = AppTab::Explorer;
+        self.category = Category::Videos;
+        self.selected_rpf = "All RPFs".into();
+        self.filter.clear();
+    }
+
+    fn open_obj_path(&mut self, path: &Path) {
+        let Some(mesh) = parse_obj(path) else {
+            self.state.lock().unwrap().status = format!("Could not read an OBJ model from {}", path.display());
+            return;
+        };
+        self.reset_selection();
+        self.mesh3d = Some(mesh);
+        self.show_3d = true;
     }
 
     fn import_catalog_csv(&mut self, csv_path: &Path) {
@@ -1487,8 +1513,10 @@ impl Rpf9App {
             let st = self.state.lock().unwrap();
             let mut entries = Vec::new();
             let mut counts = [0usize; 10];
+            let mut video_count = 0usize;
             for (idx, e) in st.entries.iter().enumerate() {
                 if !matches!(e.kind, "MODEL" | "VEH" | "NAVM") {
+                    video_count += usize::from(e.kind == "BK2");
                     continue;
                 }
                 let cat = classify_model_cat(e.kind, &e.name);
@@ -1502,6 +1530,7 @@ impl Rpf9App {
             drop(st);
             self.mv_entries = entries;
             self.mv_counts = counts;
+            self.mv_video_count = video_count;
             self.mv_ver = ver;
             self.mv_view_key = None;
         }
@@ -1573,6 +1602,7 @@ impl Rpf9App {
     fn render_model_viewer_tab(&mut self, ctx: &egui::Context, media_loading: bool, media_status: &str) {
         self.refresh_mv_view();
         let mut to_select: Option<usize> = None;
+        let mut browse_videos = false;
 
         egui::SidePanel::left("mv_sidebar")
             .default_width(360.0)
@@ -1614,12 +1644,7 @@ impl Rpf9App {
                     }
                     if ui.button("Open .OBJ").clicked() {
                         if let Some(p) = rfd::FileDialog::new().add_filter("OBJ 3D Model", &["obj"]).pick_file() {
-                            if let Some(m) = parse_obj(&p) {
-                                self.textures.clear();
-                                self.tex_handle = None;
-                                self.mesh3d = Some(m);
-                                self.show_3d = true;
-                            }
+                            self.open_obj_path(&p);
                         }
                     }
                 });
@@ -1648,6 +1673,15 @@ impl Rpf9App {
                             ui.end_row();
                         }
                     }
+                    let videos = RichText::new(format!("Videos ({})", self.mv_video_count))
+                        .size(11.5)
+                        .strong()
+                        .color(kind_color("BK2"));
+                    let button = egui::Button::new(videos)
+                        .min_size(egui::vec2(162.0, 22.0))
+                        .fill(Color32::from_rgb(32, 20, 48));
+                    browse_videos = ui.add(button).on_hover_text("Browse all .bk2 clips in Explorer").clicked();
+                    ui.end_row();
                 });
 
                 ui.add_space(8.0);
@@ -1700,15 +1734,15 @@ impl Rpf9App {
                     }
                 });
 
-                // Arrow key navigation when search box is not focused
-                if !sr.has_focus() && !self.mv_view.is_empty() {
-                    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                // Arrow key / W-S navigation when search box is not focused
+                if !sr.has_focus() && !ctx.wants_keyboard_input() && !self.mv_view.is_empty() {
+                    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::S)) {
                         let next_i = match cur_pos {
                             Some(p) if p + 1 < self.mv_view.len() => p + 1,
                             _ => 0,
                         };
                         to_select = Some(self.mv_entries[self.mv_view[next_i]].0);
-                    } else if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                    } else if ui.input(|i| i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::W)) {
                         let next_i = match cur_pos {
                             Some(0) | None => self.mv_view.len() - 1,
                             Some(p) => p - 1,
@@ -1758,6 +1792,12 @@ impl Rpf9App {
                     self.state.lock().unwrap().status = msg;
                 }
             });
+
+        if browse_videos {
+            self.browse_videos();
+            ctx.request_repaint();
+            return;
+        }
 
         if let Some(i) = to_select {
             self.select_entry(i);
@@ -2788,16 +2828,41 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
-    let tmp = std::env::temp_dir().join("rpf9_preview_awc");
-    let _ = fs::remove_dir_all(&tmp);
-    let wavs = match read_entry_bytes(e) {
-        Ok(bytes) => awc::decode_awc_bytes_to_wavs(&bytes, &tmp, "stream"),
-        Err(_) => Vec::new(),
-    };
-    let mut m = media.lock().unwrap();
-    m.loading = false;
-    m.status = format!("Decoded {} playable .wav stream(s) natively", wavs.len());
-    m.awc_streams = wavs;
+    match read_entry_bytes(e) {
+        Ok(bytes) => {
+            let res = awc::decode_awc_bytes_in_memory(&bytes, "stream", |done, total| {
+                if let Ok(mut m) = media.try_lock() {
+                    m.status = format!("Scanning AWC waveforms ({done}/{total})...");
+                }
+            });
+            let mut m = media.lock().unwrap();
+            m.loading = false;
+            if res.tracks.is_empty() {
+                let mut lines = vec![
+                    format!("Decoded 0 playable .wav stream(s) natively — {}", res.summary),
+                    format!(
+                        "Entry: {} ({} bytes read, comp={}, raw={}, offset=0x{:X}, RPF: {})",
+                        e.name, bytes.len(), e.comp_size, e.raw_size, e.offset, e.rpf_name
+                    ),
+                ];
+                lines.extend(res.details);
+                m.status = lines.join("\n");
+                m.loaded_tracks = None;
+            } else {
+                m.status = format!("Decoded {} playable .wav stream(s) natively", res.tracks.len());
+                m.loaded_tracks = Some((res.tracks, Arc::new(bytes)));
+            }
+        }
+        Err(err) => {
+            let mut m = media.lock().unwrap();
+            m.loading = false;
+            m.status = format!(
+                "Decoded 0 playable .wav stream(s) natively — Read error: {err}\nEntry: {} (comp={}, raw={}, offset=0x{:X}, RPF: {})",
+                e.name, e.comp_size, e.raw_size, e.offset, e.rpf_name
+            );
+            m.loaded_tracks = None;
+        }
+    }
 }
 
 fn setup_style(ctx: &egui::Context) {
@@ -3479,7 +3544,7 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
 impl eframe::App for Rpf9App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_sgd5_cache();
-        let (media_loading, media_status, awc_streams) = {
+        let (media_loading, media_status) = {
             let mut m = self.media.lock().unwrap();
             if let Some(mesh) = m.loaded_mesh.take() {
                 self.textures.clear();
@@ -3495,7 +3560,10 @@ impl eframe::App for Rpf9App {
                 self.tex_handle = None;
                 self.tex_zoom = 1.0;
             }
-            (m.loading, m.status.clone(), m.awc_streams.clone())
+            if let Some((tracks, awc_bytes)) = m.loaded_tracks.take() {
+                self.audio_player.set_tracks(tracks, awc_bytes);
+            }
+            (m.loading, m.status.clone())
         };
 
         egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(Color32::from_rgb(24, 14, 36)).inner_margin(10.0)).show(ctx, |ui| {
@@ -3569,20 +3637,28 @@ impl eframe::App for Rpf9App {
                         self.start_folder_scan(folder);
                     }
                 }
-                if ui.button("Open Archive").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().add_filter("RPF / TTPF Archives", &["rpf", "ttpf"]).pick_file() {
-                        self.start_single_scan(p);
+                if ui.button("Open File...").on_hover_text("Open an .rpf/.ttpf archive, .obj model, or .ps09 shader cache").clicked() {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter("Supported files", &["rpf", "ttpf", "obj", "ps09"])
+                        .add_filter("RPF / TTPF Archives", &["rpf", "ttpf"])
+                        .add_filter("OBJ models / PS09 shaders", &["obj", "ps09"])
+                        .pick_file()
+                    {
+                        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+                        if ext.eq_ignore_ascii_case("obj") {
+                            self.open_obj_path(&p);
+                        } else if ext.eq_ignore_ascii_case("ps09") {
+                            self.reset_selection();
+                            self.tab = AppTab::Shaders;
+                            self.load_ps09_path(&p);
+                        } else {
+                            self.start_single_scan(p);
+                        }
                     }
                 }
                 if ui.button("Open .OBJ").clicked() {
                     if let Some(p) = rfd::FileDialog::new().add_filter("OBJ 3D Model", &["obj"]).pick_file() {
-                        if let Some(m) = parse_obj(&p) {
-                            self.stop_bink_player();
-                            self.textures.clear();
-                            self.tex_handle = None;
-                            self.mesh3d = Some(m);
-                            self.show_3d = true;
-                        }
+                        self.open_obj_path(&p);
                     }
                 }
                 if ui.button("Import Catalog").clicked() {
@@ -3732,6 +3808,40 @@ impl eframe::App for Rpf9App {
                 ui.add_space(4.0);
             }
             self.refresh_view();
+            if !ctx.wants_keyboard_input() && !self.view.is_empty() && self.audio_player.tracks.is_empty() {
+                let cur_pos = self.selected.and_then(|sel| self.view.iter().position(|&i| i == sel));
+                let allow_wasd = !self.show_3d;
+                let step_to: Option<usize> = ctx.input(|i| {
+                    if i.key_pressed(egui::Key::ArrowDown) || (allow_wasd && i.key_pressed(egui::Key::S)) {
+                        Some(match cur_pos {
+                            Some(p) => (p + 1).min(self.view.len() - 1),
+                            None => 0,
+                        })
+                    } else if i.key_pressed(egui::Key::ArrowUp) || (allow_wasd && i.key_pressed(egui::Key::W)) {
+                        Some(match cur_pos {
+                            Some(p) => p.saturating_sub(1),
+                            None => self.view.len() - 1,
+                        })
+                    } else if i.key_pressed(egui::Key::PageDown) {
+                        Some(cur_pos.map_or(0, |p| (p + 15).min(self.view.len() - 1)))
+                    } else if i.key_pressed(egui::Key::PageUp) {
+                        Some(cur_pos.map_or(0, |p| p.saturating_sub(15)))
+                    } else if i.key_pressed(egui::Key::Home) {
+                        Some(0)
+                    } else if i.key_pressed(egui::Key::End) {
+                        Some(self.view.len() - 1)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(pos) = step_to {
+                    let target_idx = self.view[pos];
+                    if self.selected != Some(target_idx) {
+                        self.select_entry(target_idx);
+                        self.explorer_scroll_to_sel = true;
+                    }
+                }
+            }
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("{} results", self.view.len())).size(11.0).color(Color32::from_rgb(110, 118, 134)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3740,6 +3850,7 @@ impl eframe::App for Rpf9App {
             });
             let mut clicked = None;
             let mut copied_msg: Option<String> = None;
+            let scroll_to_sel = std::mem::take(&mut self.explorer_scroll_to_sel);
             // rows must be exactly row_h tall or show_rows miscomputes total height
             const ROW_H: f32 = 20.0;
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
@@ -3759,7 +3870,11 @@ impl eframe::App for Rpf9App {
                         } else {
                             format!("{}  ({})", e.name, sz_s)
                         };
-                        let resp = ui.selectable_label(self.selected == Some(*idx), RichText::new(label).size(12.5));
+                        let is_sel = self.selected == Some(*idx);
+                        let resp = ui.selectable_label(is_sel, RichText::new(label).size(12.5));
+                        if is_sel && scroll_to_sel {
+                            resp.scroll_to_me(Some(egui::Align::Center));
+                        }
                         if resp.clicked() {
                             clicked = Some(*idx);
                         }
@@ -3824,21 +3939,32 @@ impl eframe::App for Rpf9App {
                     draw_percystar_spinner(ui, 24.0);
                     ui.label(RichText::new(&media_status).color(Color32::from_rgb(252, 175, 23)));
                 });
-            } else if !awc_streams.is_empty() {
-                ui.label(RichText::new(&media_status).strong().color(Color32::WHITE));
-                ui.add_space(8.0);
-                if ui.button("Stop Audio").clicked() { stop_wav(); }
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (idx, wp) in &awc_streams {
-                        ui.horizontal(|ui| {
-                            if ui.button("Play").clicked() { play_wav_async(wp); }
-                            ui.label(format!("Stream #{idx}: {}", wp.file_name().unwrap_or_default().to_string_lossy()));
-                        });
+            } else if !self.audio_player.tracks.is_empty() {
+                audio_player::render_awc_audio_view(ui, ctx, &mut self.audio_player, &media_status);
+            } else if !media_status.is_empty() {
+                let mut lines = media_status.lines();
+                let headline = lines.next().unwrap_or(&media_status);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(headline).strong().color(Color32::from_rgb(255, 140, 120)));
+                    if ui.small_button("Copy").clicked() {
+                        ctx.copy_text(media_status.clone());
                     }
                 });
-            } else if !media_status.is_empty() {
-                ui.label(RichText::new(&media_status).color(Color32::from_rgb(255, 140, 120)));
+                let rest: Vec<&str> = lines.collect();
+                if !rest.is_empty() {
+                    ui.add_space(6.0);
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(30, 18, 44))
+                        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(110, 58, 78)))
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                                for line in rest {
+                                    ui.label(RichText::new(line).monospace().size(11.5).color(Color32::from_rgb(235, 210, 215)));
+                                }
+                            });
+                        });
+                }
             } else if !self.textures.is_empty() {
                 if self.tex_sel >= self.textures.len() {
                     self.tex_sel = 0;

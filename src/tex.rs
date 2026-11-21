@@ -293,7 +293,7 @@ pub fn decode_linear_to_rgba(lin: &[u8], w: usize, h: usize, dxgi: u8) -> Option
     if matches!(dxgi, 71 | 72 | 77 | 78 | 80 | 81 | 83 | 84 | 95 | 96 | 98 | 99) {
         let mut out_u32 = vec![0u32; w * h];
         let res = match dxgi {
-            71 | 72 => texture2ddecoder::decode_bc1(lin, w, h, &mut out_u32),
+            71 | 72 => texture2ddecoder::decode_bc1a(lin, w, h, &mut out_u32),
             77 | 78 => texture2ddecoder::decode_bc3(lin, w, h, &mut out_u32),
             80 | 81 => texture2ddecoder::decode_bc4(lin, w, h, &mut out_u32),
             83 | 84 => texture2ddecoder::decode_bc5(lin, w, h, &mut out_u32),
@@ -592,8 +592,15 @@ pub fn extract_txd_textures(v: &[u8], p: &[u8], dict_off: usize) -> Vec<DecodedT
 }
 
 /// Convert DecodedTexture into model3d::Texture2D.
-pub fn to_model_tex(t: &DecodedTexture) -> Texture2D {
-    Texture2D { w: t.w, h: t.h, pixels: t.pixels.clone() }
+pub fn to_model_tex(t: DecodedTexture) -> Texture2D {
+    let mut pixels = t.pixels;
+    if t.dxgi == 65 {
+        // texture browser shows a8 as grayscale models use it as opacity
+        for c in &mut pixels {
+            *c = Color32::from_white_alpha(c.r());
+        }
+    }
+    Texture2D { w: t.w, h: t.h, pixels }
 }
 
 /// Read RAGE9 resource virtual + physical buffers from RPF at `file_off` and decode all TXD textures.
@@ -1079,7 +1086,7 @@ pub fn decode_ttpf_texture_cached(hit: &TtpfHashHit, hash64: u64) -> Option<std:
     }
     let decoded = decode_ttpf_texture(&hit.path, hit.tex_idx)
         .ok()
-        .map(|t| std::sync::Arc::new(to_model_tex(&t)));
+        .map(|t| std::sync::Arc::new(to_model_tex(t)));
     let mut g = cache.lock().unwrap();
     if g.len() > 512 {
         g.clear();
@@ -1507,5 +1514,12 @@ mod mhiu_tests {
         assert_eq!(tex.h, 4);
         assert_eq!(tex.pixels[0], Color32::from_rgb(16, 44, 92));
         assert_ne!(tex.pixels[5], Color32::from_rgb(16, 44, 92));
+    }
+
+    #[test]
+    fn bc1_preserves_one_bit_transparency() {
+        let px = decode_linear_to_rgba(&[0, 0, 255, 255, 3, 0, 0, 0], 4, 4, 72).unwrap();
+        assert_eq!(px[0], Color32::TRANSPARENT);
+        assert_eq!(px[1], Color32::BLACK);
     }
 }
