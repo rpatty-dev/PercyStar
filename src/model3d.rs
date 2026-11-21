@@ -21,11 +21,32 @@ pub struct Texture2D {
     pub pixels: Vec<Color32>,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum MaterialPass {
+    #[default]
+    Opaque,
+    Cutout,
+    Alpha,
+    Decal,
+    Glass { texture_alpha: bool },
+}
+
 #[derive(Clone, Default)]
 pub struct GeomMaterial {
     pub texture: Option<Arc<Texture2D>>,
     pub is_vehicle_paint: bool,
+    pass: MaterialPass,
+    auxiliary_pass: bool,
 }
+
+impl GeomMaterial {
+    fn blends(&self, has_uvs: bool) -> bool {
+        matches!(self.pass, MaterialPass::Glass { .. })
+            || (has_uvs && self.texture.is_some() && matches!(self.pass, MaterialPass::Alpha | MaterialPass::Decal))
+    }
+}
+
+const GLASS_PREVIEW_ALPHA: u8 = 64;
 
 const DEFAULT_PAINT_COLOR: [f32; 3] = [0.78, 0.11, 0.14];
 
@@ -92,6 +113,7 @@ pub struct Mesh3D {
     color_buf: Vec<Color32>,
     z_buf: Vec<f32>,
     proj_buf: Vec<[f32; 3]>,
+    blend_order: Vec<(usize, f32, bool)>,
     tex: Option<TextureHandle>,
     pub dirty: bool,
     last_dragging: bool,
@@ -189,6 +211,7 @@ impl Mesh3D {
             color_buf: Vec::new(),
             z_buf: Vec::new(),
             proj_buf: Vec::new(),
+            blend_order: Vec::new(),
             tex: None,
             dirty: true,
             last_dragging: false,
@@ -724,24 +747,24 @@ fn try_extract_embedded_texture(v: &[u8], p: &[u8]) -> (Option<Texture2D>, Strin
         let decoded = crate::tex::extract_txd_textures(v, p, txd);
         if !decoded.is_empty() {
             // Prefer diffuse/albedo texture over normal/spec/blank if multiple embedded
-            let best = decoded
+            let best_i = decoded
                 .iter()
-                .find(|t| {
+                .position(|t| {
                     let lo = t.name.to_ascii_lowercase();
                     !lo.contains("_n") && !lo.contains("_nm") && !lo.contains("_s") && !lo.contains("blank") && t.w >= 32
                 })
-                .unwrap_or(&decoded[0]);
-            return (
-                Some(crate::tex::to_model_tex(best)),
-                format!("Embedded {} ({}x{} {}, {}/{})", best.name, best.w, best.h, best.fmt_name, 1, decoded.len()),
-            );
+                .unwrap_or(0);
+            let total_d = decoded.len();
+            let best = decoded.into_iter().nth(best_i).unwrap();
+            let desc = format!("Embedded {} ({}x{} {}, {}/{})", best.name, best.w, best.h, best.fmt_name, 1, total_d);
+            return (Some(crate::tex::to_model_tex(best)), desc);
         }
     }
     (None, "External .#td (Material Shading)".into())
 }
 
-// maps each lod0 vb and mb offset of drawable at base to its shader index entry
-fn drawable_lod0_shader_map(v: &[u8], base: usize) -> HashMap<(usize, usize), u16> {
+// maps each lod0 vb and mb offset of drawable at base to its shader index and render mask
+fn drawable_lod0_shader_map(v: &[u8], base: usize) -> HashMap<(usize, usize), (u16, u8)> {
     let mut out = HashMap::new();
     if base + 0x80 > v.len() { return out; }
     let Some(lod0_off) = vptr(ru64(v, base + 0x50)) else { return out };
@@ -757,6 +780,7 @@ fn drawable_lod0_shader_map(v: &[u8], base: usize) -> HashMap<(usize, usize), u1
         let gcnt = ru16(v, mp + 0x10) as usize;
         if gcnt == 0 || gcnt > 256 || garr + gcnt * 8 > v.len() { continue; }
         let smap_off = vptr(ru64(v, mp + 0x20)).filter(|&so| so + gcnt * 2 <= v.len());
+        let render_mask = v.get(mp + 0x34).copied().unwrap_or(0xff);
 
         for gi in 0..gcnt {
             let Some(gp) = vptr(ru64(v, garr + gi * 8)) else { continue };
@@ -764,7 +788,10 @@ fn drawable_lod0_shader_map(v: &[u8], base: usize) -> HashMap<(usize, usize), u1
             let Some(vb_poff) = pptr(ru64(v, gp + 0x68)) else { continue };
             let Some((mb_poff, _)) = resolve_meshlet_buffer(v, ru64(v, gp + 0x40)) else { continue };
             let sidx = smap_off.map(|so| ru16(v, so + gi * 2)).unwrap_or(gi as u16);
-            out.entry((vb_poff, mb_poff)).or_insert(sidx);
+            let binding = out.entry((vb_poff, mb_poff)).or_insert((sidx, render_mask));
+            if binding.1 & 1 == 0 && render_mask & 1 != 0 {
+                *binding = (sidx, render_mask);
+            }
         }
     }
     out
@@ -786,6 +813,7 @@ fn resolve_drawable_materials(
     const EMISSIVE_TEX: u32 = 0x8e0d_63ee; // emissiveTex
     const DIRT_DIFFUSE_TEX: u32 = 0x7485_dafb; // dirtDiffuseTex
     const SHARED_LUT_PARAM: u32 = 0x19df_25d7; // shared 128x256 vehicle lookup texture
+    const GLASS_SHADER: u32 = 0xe3ba_3129;
 
     let mut mats = vec![GeomMaterial::default(); geoms.len()];
     if base + 0x18 > v.len() { return mats; }
@@ -799,10 +827,15 @@ fn resolve_drawable_materials(
     if s0 + 8 > v.len() || (ru64(v, s0) >> 32) != 0x6d65_7461 { return mats; }
 
     let smap = drawable_lod0_shader_map(v, base);
+    let has_main_pass = smap.values().any(|&(_, mask)| mask & 1 != 0);
     let mut shader_cache: HashMap<u16, GeomMaterial> = HashMap::new();
 
     for (gi, &(vb_poff, _, mb_poff, _)) in geoms.iter().enumerate() {
-        let sidx = smap.get(&(vb_poff, mb_poff)).copied().unwrap_or(gi as u16);
+        let (sidx, mask) = smap.get(&(vb_poff, mb_poff)).copied().unwrap_or((gi as u16, 0xff));
+        if has_main_pass && mask & 1 == 0 {
+            mats[gi].auxiliary_pass = true;
+            continue;
+        }
         if let Some(cached) = shader_cache.get(&sidx) {
             mats[gi] = cached.clone();
             continue;
@@ -811,6 +844,13 @@ fn resolve_drawable_materials(
         if (sidx as usize) < scnt {
             if let Some(saddr) = vptr(ru64(v, sp + (sidx as usize) * 8)) {
                 if saddr + 0x28 <= v.len() {
+                    mat.pass = match v.get(saddr + 0x3c) {
+                        Some(2) if ru32(v, saddr) == GLASS_SHADER => MaterialPass::Glass { texture_alpha: false },
+                        Some(2) => MaterialPass::Alpha,
+                        Some(4) => MaterialPass::Decal,
+                        Some(8) => MaterialPass::Cutout,
+                        _ => MaterialPass::Opaque,
+                    };
                     if let (Some(p2), Some(p4)) = (vptr(ru64(v, saddr + 0x10)), vptr(ru64(v, saddr + 0x20))) {
                         if p4 + 8 <= v.len() {
                             let tcnt = (v[p4 + 1] as usize).min(48);
@@ -819,6 +859,7 @@ fn resolve_drawable_materials(
                             let mut alt0_cand: Option<(u64, crate::tex::TtpfHashHit)> = None;
                             let mut emissive_cand: Option<(u64, crate::tex::TtpfHashHit)> = None;
                             let mut fallback_srgb: Option<(u64, crate::tex::TtpfHashHit)> = None;
+                            let uses_opacity = !matches!(mat.pass, MaterialPass::Opaque);
 
                             for k in 0..tcnt {
                                 let ent = p4 + 8 + k * 8;
@@ -836,7 +877,8 @@ fn resolve_drawable_materials(
                                 if ref_off + 16 > v.len() { continue; }
                                 let h64 = ru64(v, ref_off + 8);
                                 let Some(hit) = idx_map.get(&h64) else { continue };
-                                if hit.is_normal_format() || hit.dxgi == 65 { continue; }
+                                if hit.is_normal_format() { continue; }
+                                if hit.dxgi == 65 && !(uses_opacity && param_hash == DIFFUSE_TEX) { continue; }
 
                                 if param_hash == DIFFUSE_TEX && hit.w >= 4 && hit.h >= 4 {
                                     diffuse_cand = Some((h64, hit.clone()));
@@ -875,7 +917,15 @@ fn resolve_drawable_materials(
                                     }
                                 }
                             }
-                            mat.is_vehicle_paint = is_vehicle && has_tint && !had_tex_ref;
+                            if matches!(mat.pass, MaterialPass::Glass { .. }) {
+                                if mat.texture.as_ref().is_some_and(|t| t.w <= 4 && t.h <= 4 && t.pixels.iter().all(|p| p.a() == 0)) {
+                                    mat.texture = None;
+                                }
+                                mat.pass = MaterialPass::Glass {
+                                    texture_alpha: mat.texture.as_ref().is_some_and(|t| t.pixels.iter().any(|p| p.a() < 255)),
+                                };
+                            }
+                            mat.is_vehicle_paint = is_vehicle && has_tint && !had_tex_ref && mat.pass == MaterialPass::Opaque;
                         }
                     }
                 }
@@ -1197,13 +1247,14 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
 
     let resolved_tex_geoms = geom_materials.iter().filter(|m| m.texture.is_some()).count();
     let paint_geoms = geom_materials.iter().filter(|m| m.is_vehicle_paint).count();
+    let preview_geoms = geom_materials.iter().filter(|m| !m.auxiliary_pass).count().max(1);
     if texture.is_none() {
         if resolved_tex_geoms > 0 && paint_geoms > 0 {
-            tex_status = format!("TTPF: {resolved_tex_geoms}/{geom_count} mats + Car Paint");
+            tex_status = format!("TTPF: {resolved_tex_geoms}/{preview_geoms} mats + Car Paint");
         } else if resolved_tex_geoms > 0 {
-            tex_status = format!("TTPF: {resolved_tex_geoms}/{geom_count} mats");
+            tex_status = format!("TTPF: {resolved_tex_geoms}/{preview_geoms} mats");
         } else if paint_geoms > 0 {
-            tex_status = format!("Car Paint ({paint_geoms}/{geom_count} geoms)");
+            tex_status = format!("Car Paint ({paint_geoms}/{preview_geoms} geoms)");
         }
     }
 
@@ -1268,6 +1319,13 @@ fn draw_line_z(
         y += sy;
         z += sz;
     }
+}
+
+#[inline]
+fn blend_preview_pixel(dst: &mut Color32, src: Color32, alpha: u8) {
+    let a = alpha as u16;
+    let mix = |s: u8, d: u8| ((s as u16 * a + d as u16 * (255 - a) + 127) / 255) as u8;
+    *dst = Color32::from_rgb(mix(src.r(), dst.r()), mix(src.g(), dst.g()), mix(src.b(), dst.b()));
 }
 
 fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
@@ -1349,7 +1407,54 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
 
         if do_solid {
             let vis = mesh.visible_tris();
-            for (ti, t) in mesh.tris.iter().enumerate().skip(vis.start).take(vis.len()) {
+            let has_preview_texture = do_textured && has_uvs
+                && mesh.geom_materials.iter().any(|m| m.pass == MaterialPass::Cutout && m.texture.is_none())
+                && mesh.tri_geom.get(vis.clone()).is_some_and(|ids| {
+                    ids.iter().any(|&g| mesh.geom_materials.get(g as usize).is_some_and(|m| m.texture.is_some()))
+                });
+            let use_blending = do_textured && mesh.texture.is_none()
+                && mesh.geom_materials.iter().any(|m| m.blends(has_uvs));
+            let blend_material = |ti: usize| {
+                if !use_blending { return None; }
+                let g = mesh.tri_geom.get(ti).copied().unwrap_or(0) as usize;
+                mesh.geom_materials.get(g).filter(|m| m.blends(has_uvs) && !m.auxiliary_pass)
+            };
+            mesh.blend_order.clear();
+            if use_blending {
+                for ti in vis.clone() {
+                    if let Some(mat) = blend_material(ti) {
+                        let [a, b, c] = mesh.tris[ti].map(|i| mesh.proj_buf[i as usize][2]);
+                        mesh.blend_order.push((ti, a + b + c, mat.pass == MaterialPass::Decal));
+                    }
+                }
+                mesh.blend_order.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.total_cmp(&b.1)));
+            }
+            let solid_tris = vis.filter(|&ti| blend_material(ti).is_none());
+            for ti in solid_tris.chain(mesh.blend_order.iter().map(|&(ti, _, _)| ti)) {
+                let t = mesh.tris[ti];
+                let g = mesh.tri_geom.get(ti).copied().unwrap_or(0) as usize;
+                let gmat = mesh.geom_materials.get(g);
+                let active_tex: Option<&Texture2D> = if do_textured && has_uvs {
+                    mesh.texture.as_ref().or_else(|| gmat.and_then(|m| m.texture.as_deref()))
+                } else {
+                    None
+                };
+                if do_textured && gmat.is_some_and(|m| m.auxiliary_pass
+                    || (m.pass == MaterialPass::Cutout && active_tex.is_none() && has_preview_texture))
+                {
+                    continue;
+                }
+                let blend = blend_material(ti).is_some();
+                let pass = if do_textured && mesh.texture.is_some() {
+                    MaterialPass::Cutout
+                } else if do_textured {
+                    gmat.map_or(MaterialPass::Opaque, |m| m.pass)
+                } else {
+                    MaterialPass::Opaque
+                };
+                let glass = matches!(pass, MaterialPass::Glass { .. });
+                let depth_bias = if blend && pass == MaterialPass::Decal { mesh.radius * 0.0001 } else { 0.0 };
+
                 let i0 = t[0] as usize;
                 let i1 = t[1] as usize;
                 let i2 = t[2] as usize;
@@ -1386,19 +1491,13 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                 let shade_g = (0.18 + ndl1 * 0.72 + ndl2 * 0.18 + spec + rim * 0.40).min(1.15);
                 let shade_b = (0.20 + ndl1 * 0.70 + ndl2 * 0.28 + spec + rim * 0.55).min(1.15);
 
-                let g = mesh.tri_geom.get(ti).copied().unwrap_or(0) as usize;
-                let gmat = mesh.geom_materials.get(g);
-                let active_tex: Option<&Texture2D> = if do_textured && has_uvs {
-                    mesh.texture.as_ref().or_else(|| gmat.and_then(|m| m.texture.as_deref()))
-                } else {
-                    None
-                };
-
                 let is_paint = do_textured
                     && active_tex.is_none()
                     && gmat.map(|m| m.is_vehicle_paint).unwrap_or(false);
                 let base_albedo = if is_paint {
                     mesh.paint_color
+                } else if glass {
+                    [0.62, 0.71, 0.78]
                 } else if do_textured && active_tex.is_none() {
                     MAT_PALETTE[g % MAT_PALETTE.len()]
                 } else {
@@ -1448,17 +1547,35 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                             if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
                                 let (b0, b1, b2) = (w0 * inv_abs, w1 * inv_abs, w2 * inv_abs);
                                 let z = b0 * p0[2] + b1 * p1[2] + b2 * p2[2];
-                                if z > z_row[x] {
-                                    z_row[x] = z;
+                                if z + depth_bias > z_row[x] {
                                     let tc = tex.sample(
                                         b0 * uv0[0] + b1 * uv1[0] + b2 * uv2[0],
                                         b0 * uv0[1] + b1 * uv1[1] + b2 * uv2[1],
                                     );
-                                    c_row[x] = Color32::from_rgb(
-                                        ((tc.r() as f32 * shade_r).min(255.0)) as u8,
-                                        ((tc.g() as f32 * shade_g).min(255.0)) as u8,
-                                        ((tc.b() as f32 * shade_b).min(255.0)) as u8,
-                                    );
+                                    let alpha = match pass {
+                                        MaterialPass::Opaque => 255,
+                                        MaterialPass::Cutout => if tc.a() >= 128 { 255 } else { 0 },
+                                        MaterialPass::Glass { texture_alpha: false } => GLASS_PREVIEW_ALPHA,
+                                        _ => tc.a(),
+                                    };
+                                    if alpha != 0 {
+                                        let [r, g, b, _] = if pass != MaterialPass::Opaque && tc.a() != 255 {
+                                            tc.to_srgba_unmultiplied()
+                                        } else {
+                                            tc.to_array()
+                                        };
+                                        let src = Color32::from_rgb(
+                                            ((r as f32 * shade_r).min(255.0)) as u8,
+                                            ((g as f32 * shade_g).min(255.0)) as u8,
+                                            ((b as f32 * shade_b).min(255.0)) as u8,
+                                        );
+                                        if blend {
+                                            blend_preview_pixel(&mut c_row[x], src, alpha);
+                                        } else {
+                                            z_row[x] = z;
+                                            c_row[x] = src;
+                                        }
+                                    }
                                 }
                             }
                             w0 += e12_dx;
@@ -1481,8 +1598,12 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                         if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
                             let z = (w0 * p0[2] + w1 * p1[2] + w2 * p2[2]) * inv_abs;
                             if z > z_row[x] {
-                                z_row[x] = z;
-                                c_row[x] = flat_col;
+                                if glass {
+                                    blend_preview_pixel(&mut c_row[x], flat_col, GLASS_PREVIEW_ALPHA);
+                                } else {
+                                    z_row[x] = z;
+                                    c_row[x] = flat_col;
+                                }
                             }
                         }
                         w0 += e12_dx;
@@ -1749,6 +1870,74 @@ mod tests {
         assert!(p[2][0] > 100.0, "+X must be screen-right (no mirror)");
         assert!(p[3][1] < p[4][1], "positive pitch views from above");
         assert!(p[4][2] > p[3][2], "-Y side is closer to camera");
+    }
+
+    #[test]
+    fn cutout_holes_do_not_occlude_geometry() {
+        let verts = vec![
+            [-1.0, -0.1, -1.0], [1.0, -0.1, -1.0], [0.0, -0.1, 1.0],
+            [-1.0, 0.1, -1.0], [1.0, 0.1, -1.0], [0.0, 0.1, 1.0],
+        ];
+        let mut m = Mesh3D::from_parts(
+            "cutout".into(), verts, vec![[0.0; 2]; 6], vec![[0, 1, 2], [3, 4, 5]],
+            vec![0, 1], vec![], None, String::new(), 2, 0, String::new(),
+        );
+        m.yaw = 0.0;
+        m.pitch = 0.0;
+        m.geom_materials = vec![
+            GeomMaterial {
+                texture: Some(Arc::new(Texture2D { w: 1, h: 1, pixels: vec![Color32::TRANSPARENT] })),
+                pass: MaterialPass::Cutout,
+                ..Default::default()
+            },
+            GeomMaterial {
+                texture: Some(Arc::new(Texture2D { w: 1, h: 1, pixels: vec![Color32::GREEN] })),
+                ..Default::default()
+            },
+        ];
+        let center = 50 * 100 + 50;
+        rasterize_mesh(&mut m, 100, 100);
+        assert!(m.color_buf[center].g() > 0, "back triangle shows through hole");
+        assert!(m.z_buf[center] < 0.0, "hole must not write depth");
+        Arc::get_mut(m.geom_materials[0].texture.as_mut().unwrap()).unwrap().pixels[0] = Color32::RED;
+        rasterize_mesh(&mut m, 100, 100);
+        assert!(m.color_buf[center].r() > 0 && m.z_buf[center] > 0.0, "wire writes depth");
+    }
+
+    #[test]
+    fn blended_layers_respect_depth_and_decal_order() {
+        let verts = [-0.2, 0.0, 0.0, -0.1, 0.2].into_iter()
+            .flat_map(|y| [[-1.0, y, -1.0], [1.0, y, -1.0], [0.0, y, 1.0]])
+            .collect();
+        let mut m = Mesh3D::from_parts(
+            "layers".into(), verts, vec![[0.0; 2]; 15], (0..5).map(|i| [i * 3, i * 3 + 1, i * 3 + 2]).collect(),
+            (0..5).collect(), vec![], None, String::new(), 5, 0, String::new(),
+        );
+        m.yaw = 0.0;
+        m.pitch = 0.0;
+        let glass = MaterialPass::Glass { texture_alpha: true };
+        m.geom_materials = [
+            ([255, 0, 0, 128], glass), ([0, 0, 255, 255], MaterialPass::Opaque),
+            ([0, 255, 0, 128], MaterialPass::Decal), ([0, 255, 0, 128], glass),
+            ([255, 255, 255, 255], glass),
+        ].into_iter().map(|([r, g, b, a], pass)| GeomMaterial {
+            texture: Some(Arc::new(Texture2D { w: 1, h: 1, pixels: vec![Color32::from_rgba_unmultiplied(r, g, b, a)] })),
+            pass,
+            ..Default::default()
+        }).collect();
+        let center = 50 * 100 + 50;
+        rasterize_mesh(&mut m, 100, 100);
+        let composited = m.color_buf[center];
+        assert_eq!(m.z_buf[center], 0.0, "only opaque layer writes depth");
+        assert!(composited.r() > composited.g() && composited.b() > 0, "near red over green with blue visible");
+        m.geom_materials[4].texture = None;
+        m.geom_materials[4].pass = MaterialPass::Opaque;
+        rasterize_mesh(&mut m, 100, 100);
+        assert_eq!(m.color_buf[center], composited, "hidden layer must not affect pixel");
+        m.geom_materials[2].texture = None;
+        m.geom_materials[2].auxiliary_pass = true;
+        rasterize_mesh(&mut m, 100, 100);
+        assert!(m.color_buf[center].g() < composited.g(), "coplanar decal blends over base");
     }
 
     #[test]
