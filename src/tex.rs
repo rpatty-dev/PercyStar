@@ -747,7 +747,7 @@ pub fn scan_ttpf_descriptors(path: &Path) -> Result<(String, Vec<TtpfTexMeta>), 
         return Err("Not an RDS5 TTPF file".into());
     }
     let n_chunks = ru32(&hdr, 4);
-    let tot_uncomp = ru32(&hdr, 8) as u64;
+    let tot_uncomp = ru64(&hdr, 8) & 0xff_ffff_ffff;
     let hdr_pages = ru32(&hdr, 16) as u64;
     let etpf_off = hdr_pages * 0x100;
 
@@ -773,7 +773,7 @@ pub fn scan_ttpf_descriptors(path: &Path) -> Result<(String, Vec<TtpfTexMeta>), 
         // ETPF u1 bits 3..9 ((u1 >> 3) & 0x7F) is the exact Microsoft DXGI_FORMAT enum!
         let dxgi = ((u1 >> 3) & 0x7F) as u8;
         let has_mips = (u1 >> 24) > 0;
-        let page4k = (u2 & 0x000F_FFFF) as u64;
+        let page4k = (u2 & 0x001F_FFFF) as u64;
         out.push(TtpfTexMeta { idx: i, w, h, fmt_byte, dxgi, has_mips, byte_off: page4k * 0x1000, alloc_sz: 0 });
     }
     let mut offs: Vec<u64> = out.iter().map(|d| d.byte_off).collect();
@@ -1484,6 +1484,9 @@ pub fn decode_mhiu_heightmap(data: &[u8]) -> Option<DecodedTexture> {
         raw_dds_payload: Vec::new(),
     })
 }
+
+#[cfg(test)]
+mod large_address_tests;
 
 #[cfg(test)]
 mod mhiu_tests {
