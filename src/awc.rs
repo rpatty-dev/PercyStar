@@ -206,9 +206,13 @@ fn parse_adat_header(data: &[u8]) -> ParsedAdatHeader {
         })
         .map(|(_, c)| c);
 
-    if best.is_none() && hdr_sz >= 0x18 {
+    let needs_backward_recovery = best.as_ref().map_or(true, |candidate| {
+        !candidate.data_chunks.is_empty() && candidate.data_chunks.len() != sc
+    });
+    if hdr_sz >= 0x18 && needs_backward_recovery {
         let mut data_chunks = Vec::new();
         let mut format_rates = Vec::new();
+        let mut pending_rate = 0u32;
         let mut back = hdr_sz;
         while back >= 0x18 {
             let entry_off = back - 8;
@@ -216,12 +220,19 @@ fn parse_adat_header(data: &[u8]) -> ParsedAdatHeader {
             let tag = (val >> 56) as u8;
             let sz = ((val >> 28) & 0x0FFF_FFFF) as usize;
             let coff = (val & 0x0FFF_FFFF) as usize;
-            if tag == 0x55 && sz > 0 && coff >= hdr_sz && coff < data.len() {
-                data_chunks.push((coff, sz.min(data.len() - coff), 0));
-            } else if tag == 0x76 && sz >= 10 && coff + 10 <= data.len() {
-                let sr = ru16(data, coff + 8) as u32;
-                if (8_000..=192_000).contains(&sr) {
-                    format_rates.push(sr);
+            if tag == 0x55 {
+                if sz > 0 && coff >= hdr_sz && coff < data.len() {
+                    data_chunks.push((coff, sz.min(data.len() - coff), pending_rate));
+                }
+                pending_rate = 0;
+            } else if tag == 0x76 {
+                pending_rate = 0;
+                if sz >= 10 && coff + 10 <= data.len() {
+                    let sr = ru16(data, coff + 8) as u32;
+                    if (8_000..=192_000).contains(&sr) {
+                        format_rates.push(sr);
+                        pending_rate = sr;
+                    }
                 }
             } else if !matches!(tag, 0x48 | 0x55 | 0x76 | 0xA3 | 0xBD | 0xFA | 0xFF) && coff > data.len() {
                 break;
@@ -229,15 +240,24 @@ fn parse_adat_header(data: &[u8]) -> ParsedAdatHeader {
             back -= 8;
         }
         data_chunks.reverse();
-        best = Some(CandidateScan {
+        let current_is_exact = best.as_ref().is_some_and(|candidate| candidate.data_chunks.len() == sc);
+        let recovery_is_exact = data_chunks.len() == sc && !current_is_exact;
+        let recovered = CandidateScan {
             data_chunks,
-            format_rates,
+            // Recovered sample rates are attached directly to their 0x55
+            // chunks above. Do not reuse a forward candidate's unrelated
+            // rates for chunks that have no paired 0x76 record. Keep the
+            // legacy rate list only for the old no-candidate fallback.
+            format_rates: if recovery_is_exact { Vec::new() } else { format_rates },
             total_entries: 0,
             tag_counts: BTreeMap::new(),
             sample_entries: Vec::new(),
             skipped_chunks: Vec::new(),
             bogus: 0,
-        });
+        };
+        if recovery_is_exact || best.is_none() {
+            best = Some(recovered);
+        }
     }
 
     let Some(chosen) = best else {
@@ -814,4 +834,72 @@ mod tests {
         let res = decode_awc_bytes_in_memory(&adat, "hud_u16", |_, _| {});
         assert_eq!(res.tracks.len(), 3);
     }
+
+    #[test]
+    fn late_aligned_table_beats_eight_false_u32_candidates() {
+        // Reproduce the selection failure shape seen in issue #48 without
+        // bundling game audio: the u32 candidate starts at 0x7ec and sees
+        // eight in-bounds 0x55-looking records inside the header. A synthetic
+        // 503-entry table is later in the header, on the reverse walk's
+        // 2-mod-8 alignment, and points beyond the header.
+        let sc = 503usize;
+        let hdr_sz = 0x518Ausize;
+        let data_end = hdr_sz + sc * 32;
+        let mut adat = vec![0u8; data_end];
+        adat[0..4].copy_from_slice(b"ADAT");
+        adat[4..8].copy_from_slice(&0xFF02_0001u32.to_le_bytes());
+        adat[8..12].copy_from_slice(&(sc as u32).to_le_bytes());
+        adat[12..16].copy_from_slice(&(hdr_sz as u32).to_le_bytes());
+
+        for i in 0..8 {
+            let false_off = 0x100 + i * 0x20;
+            let entry = (0x55u64 << 56) | (8u64 << 28) | false_off as u64;
+            let at = 16 + sc * 4 + i * 8;
+            adat[at..at + 8].copy_from_slice(&entry.to_le_bytes());
+        }
+
+        // Two other 0x55-looking header records in the real sample point past
+        // the container. They must not be counted as recovered streams.
+        let outside_off = (data_end + 0x1000) as u64;
+        for at in [0x5C2usize, 0x902] {
+            let entry = (0x55u64 << 56) | (0x800u64 << 28) | outside_off;
+            adat[at..at + 8].copy_from_slice(&entry.to_le_bytes());
+        }
+
+        // Model the late per-stream sequence: 0x55 data, 0x76 format,
+        // 0xA3 metadata, with a 0x36 record in most groups. This reproduces the
+        // mixed 24/32-byte groups and reverse walk's 2-mod-8 alignment.
+        let table_start = 0x13C2usize;
+        let mut at = table_start;
+        for i in 0..sc {
+            let data_off = hdr_sz + i * 16;
+            let fmt_off = hdr_sz + sc * 16 + i * 16;
+            let sample_rate = if i % 2 == 0 { 32_000u16 } else { 48_000u16 };
+
+            let e55 = (0x55u64 << 56) | (8u64 << 28) | data_off as u64;
+            let e76 = (0x76u64 << 56) | (10u64 << 28) | fmt_off as u64;
+            let ea3 = (0xA3u64 << 56) | (8u64 << 28) | fmt_off as u64;
+            adat[at..at + 8].copy_from_slice(&e55.to_le_bytes());
+            adat[at + 8..at + 16].copy_from_slice(&e76.to_le_bytes());
+            adat[at + 16..at + 24].copy_from_slice(&ea3.to_le_bytes());
+            adat[fmt_off + 8..fmt_off + 10].copy_from_slice(&sample_rate.to_le_bytes());
+            at += 24;
+            if i < 468 {
+                let e36 = (0x36u64 << 56) | (8u64 << 28) | fmt_off as u64;
+                adat[at..at + 8].copy_from_slice(&e36.to_le_bytes());
+                at += 8;
+            }
+        }
+        assert_eq!(at, hdr_sz);
+
+        let ParsedAdatHeader::Ok { data_chunks, sc: parsed_sc, .. } = parse_adat_header(&adat) else {
+            panic!("synthetic ADAT header should parse");
+        };
+        assert_eq!(parsed_sc, 503);
+        assert_eq!(data_chunks.len(), 503);
+        for (i, chunk) in data_chunks.iter().enumerate() {
+            assert_eq!(chunk.2, if i % 2 == 0 { 32_000 } else { 48_000 });
+        }
+    }
+
 }
