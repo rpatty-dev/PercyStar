@@ -1635,6 +1635,42 @@ pub fn probe_gxt_snippet(head: &[u8]) -> Option<String> {
     None
 }
 
+// follow {u32, u32 len, u64 ptr} records to null-terminated utf8 string pools,
+// which hold the text of small tables and can sit after the bitmap region
+fn gxt_pool_strings(data: &[u8]) -> Vec<String> {
+    let mut pools: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut o = 0x60;
+    while o + 16 <= data.len() {
+        let len = ru32(data, o + 4) as usize;
+        let ptr = ru64(data, o + 8);
+        o += 8;
+        if !(2..=1 << 20).contains(&len) || !(0x5000_0000..0x5000_0000 + data.len() as u64).contains(&ptr) {
+            continue;
+        }
+        let a = (ptr - 0x5000_0000) as usize;
+        let Some(b) = data.get(a..a + len) else { continue };
+        if b[len - 1] != 0 || pools.iter().any(|(pa, _)| *pa == a) {
+            continue;
+        }
+        let mut segs = Vec::new();
+        let mut valid = true;
+        for raw in b[..len - 1].split(|&c| c == 0).filter(|r| !r.is_empty()) {
+            match std::str::from_utf8(raw) {
+                Ok(s) if s.chars().all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t')) => segs.push(s.trim().to_string()),
+                _ => {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if valid && segs.iter().any(|s| s.chars().any(char::is_alphabetic)) {
+            pools.push((a, segs));
+        }
+    }
+    pools.sort_by_key(|(a, _)| *a);
+    pools.into_iter().flat_map(|(_, s)| s).filter(|s| !s.is_empty()).collect()
+}
+
 // extract clean readable utf8 strings from a rage9 0drpz localization text table across all 13 languages
 pub fn decode_0drpz_text(data: &[u8]) -> Option<String> {
     let start = if data.len() >= 0x60 && &data[0x10..0x15] == b"0DRPz" { 0x60 } else { 0 };
@@ -1666,8 +1702,17 @@ pub fn decode_0drpz_text(data: &[u8]) -> Option<String> {
             if lines.len() >= 6000 { break; }
         }
     }
+    let pooled = if start == 0x60 { gxt_pool_strings(data) } else { Vec::new() };
     if lines.len() < 3 {
-        return None;
+        // small tables hold only one or two strings, so trust the pointed-to pools alone
+        if pooled.is_empty() {
+            return None;
+        }
+        lines = pooled;
+    } else {
+        // pools can sit past the scanned range, so add any string the scan missed
+        let seen: std::collections::HashSet<String> = lines.iter().cloned().collect();
+        lines.extend(pooled.into_iter().filter(|s| !seen.contains(s)));
     }
     let header = format!("=== RAGE9 Text Table ({} strings) ===\n\n", lines.len());
     Some(header + &lines.join("\n"))

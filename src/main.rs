@@ -6843,6 +6843,19 @@ mod tests {
         assert!(tex::probe_gxt_snippet(&gxt).is_some());
         let txt = decode_0drpz_text(&gxt).expect("unicode gxt should decode");
         assert!(txt.contains("彩色字幕") && txt.contains("Привет мир") && txt.contains("한국어 자막") && txt.contains("日本語テキスト"));
+
+        // small table: two strings in a pool past the bitmap end, reached only through a {u32, len, ptr} record
+        let mut small = vec![0u8; 0xC0];
+        small[0x08..0x10].copy_from_slice(&0x5000_0080u64.to_le_bytes());
+        small[0x10..0x15].copy_from_slice(b"0DRPz");
+        small[0x60..0x64].copy_from_slice(b"O\x80\x80\x80");
+        let pool = "Open the door\0テスト文字列\0".as_bytes();
+        small[0xA0..0xA4].copy_from_slice(&0x10u32.to_le_bytes());
+        small[0xA4..0xA8].copy_from_slice(&(pool.len() as u32).to_le_bytes());
+        small[0xA8..0xB0].copy_from_slice(&0x5000_00C0u64.to_le_bytes());
+        small.extend_from_slice(pool);
+        let txt = decode_0drpz_text(&small).expect("small pooled gxt should decode");
+        assert!(txt.contains("(2 strings)") && txt.contains("Open the door") && txt.contains("テスト文字列"));
     }
 
     /// Writes sample PNGs from a big .ttpf so decode quality can be eyeballed:
