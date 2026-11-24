@@ -2,7 +2,7 @@ use crate::model3d::{Mesh3D, Texture2D};
 use crate::worldmap::WorldMapData;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -83,6 +83,60 @@ pub enum WorldStreamMsg {
     ArchetypeDone,
 }
 
+pub const DEFAULT_VRAM_BUDGET_BYTES: usize = 5800 * 1024 * 1024; // 5.8 GB target ceiling (~5.5 - 6.0 GB)
+
+#[derive(Debug)]
+pub struct StreamThrottleState {
+    pub stream_radius: f32,
+    pub vram_pressure: bool,
+    pub evicted_hashes: Vec<u32>,
+}
+
+impl StreamThrottleState {
+    pub fn new() -> Self {
+        Self {
+            stream_radius: 35000.0,
+            vram_pressure: false,
+            evicted_hashes: Vec::new(),
+        }
+    }
+}
+
+pub fn compute_throttle_tier(total_vram_bytes: usize, budget_bytes: usize) -> (f32, bool, &'static str) {
+    let ratio = total_vram_bytes as f32 / budget_bytes.max(1) as f32;
+    if ratio >= 0.88 || total_vram_bytes >= 5_500 * 1024 * 1024 {
+        (350.0, true, "CRITICAL: EVICTING (350m)")
+    } else if ratio >= 0.80 || total_vram_bytes >= 4_800 * 1024 * 1024 {
+        (450.0, true, "NEAR CAPACITY: THROTTLED (450m)")
+    } else if ratio >= 0.70 {
+        (1500.0, false, "HIGH LOAD: 1.5km")
+    } else if ratio >= 0.55 {
+        (3000.0, false, "MODERATE: 3km")
+    } else if ratio >= 0.40 {
+        (6000.0, false, "HEADROOM: 6km")
+    } else {
+        (35000.0, false, "OPTIMAL: UNCAPPED (35km)")
+    }
+}
+
+pub fn archetype_hash_from_mesh_name(name: &str) -> u32 {
+    if let Some(rest) = name.strip_prefix("arch_") {
+        u32::from_str_radix(rest, 16).unwrap_or(0)
+    } else if name == "mhiu_world_terrain" {
+        0
+    } else if name.starts_with("nav_") || name.contains("road") || name.contains("street") {
+        1
+    } else if name == "__placeholder_boxes__" {
+        2
+    } else {
+        let mut h: u32 = 0x811c9dc5;
+        for b in name.as_bytes() {
+            h = (h ^ (*b as u32)).wrapping_mul(0x01000193);
+        }
+        h
+    }
+}
+
 pub fn launch_world_gpu_process(
     common_rpf: Option<&Path>,
     levels_rpf: Option<&Path>,
@@ -143,6 +197,19 @@ pub fn launch_world_gpu_process(
     Ok(rx)
 }
 
+static WORLD_LOGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn log_world(msg: impl Into<String>) {
+    let s = msg.into();
+    eprintln!("{s}");
+    if let Ok(mut logs) = WORLD_LOGS.lock() {
+        if logs.len() >= 400 {
+            logs.remove(0);
+        }
+        logs.push(s);
+    }
+}
+
 pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -> Result<(), String> {
     #[cfg(windows)]
     unsafe {
@@ -176,50 +243,223 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
     let (tx, rx) = mpsc::sync_channel(16);
     let cam_track = Arc::new(std::sync::Mutex::new((Vec3::from_array(cfg.start_pos), 1u64)));
     let cam_track_bg = Arc::clone(&cam_track);
+    let stream_ctl = Arc::new(std::sync::Mutex::new(StreamThrottleState::new()));
+    let stream_ctl_bg = Arc::clone(&stream_ctl);
     if let Some(lp) = cfg.levels_rpf.clone() {
         std::thread::spawn(move || {
-            // 1. fast-load brickell slod city blocks immediately
-            if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, 8_679_358_480, "brickell_slod") {
-                let _ = tx.send(WorldStreamMsg::Batch(WorldBatchInput {
-                    mesh,
-                    instances: vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, [1.0; 4])],
-                }));
+            // 1. Stream real CNavMesh road tiles concurrently across full world map
+            let nav_rpf = lp.parent().map(|p| p.join("navmeshes.rpf")).filter(|p| p.exists());
+            if let Some(ref np) = nav_rpf {
+                let np = np.clone();
+                let nav_tx = tx.clone();
+                let cam_track_bg = Arc::clone(&cam_track_bg);
+                std::thread::spawn(move || {
+                    if let Some(base) = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) {
+                        let tsv = base.join("PercyStar").join("scan_cache_v9.tsv");
+                        if let Ok(f) = std::fs::File::open(tsv) {
+                            use std::io::BufRead;
+                            let r = std::io::BufReader::new(f);
+                            let start = cam_track_bg.lock().unwrap().0;
+                            let mut nav_tiles: Vec<(f32, String, u64)> = Vec::new();
+                            for line in r.lines().map_while(Result::ok) {
+                                if !line.contains("\tNAVM\t") { continue; }
+                                let parts: Vec<&str> = line.split('\t').collect();
+                                if parts.len() < 6 { continue; }
+                                let tile_nm = parts[3];
+                                let Ok(off) = parts[5].parse::<u64>() else { continue };
+                                if let (Some(s_p), Some(e_p)) = (tile_nm.find('('), tile_nm.find(')')) {
+                                    let cparts: Vec<&str> = tile_nm[s_p + 1..e_p].split(',').collect();
+                                    if cparts.len() == 2 {
+                                        if let (Ok(tx_c), Ok(ty_c)) = (cparts[0].parse::<f32>(), cparts[1].parse::<f32>()) {
+                                            let dx = tx_c - start.x;
+                                            let dy = ty_c - start.y;
+                                            let d = (dx * dx + dy * dy).sqrt();
+                                            if d <= 35000.0 {
+                                                nav_tiles.push((d, tile_nm.to_string(), off));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            nav_tiles.sort_by(|a, b| a.0.total_cmp(&b.0));
+                            log_world(format!("[world-gpu] Streaming {} CNavMesh road tiles across full world...", nav_tiles.len().min(2000)));
+                            for (_dist, tile_nm, off) in nav_tiles.into_iter().take(2000) {
+                                if let Ok(mesh) = crate::tex::decode_navmesh_roads_from_rpf(&np, off, &tile_nm) {
+                                    let _ = nav_tx.send(WorldStreamMsg::Batch(WorldBatchInput {
+                                        mesh,
+                                        instances: vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, [1.0; 4])],
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                });
             }
             // 2. build/load cached 0DRPz map placements + model index
-            eprintln!("[world-gpu] loading/building world index from {}", lp.display());
+            log_world(format!("[world-gpu] loading/building world index from {}", lp.display()));
             let ix = crate::mapdata::build_or_load_world_index(&lp);
-            eprintln!("[world-gpu] index ready: {} maps, {} models, {} entities", ix.map_count, ix.models.len(), ix.entities.len());
+            log_world(format!("[world-gpu] index ready: {} maps, {} models, {} entities", ix.map_count, ix.models.len(), ix.entities.len()));
             let _ = tx.send(WorldStreamMsg::MapCount(ix.map_count));
 
             let mut grouped: HashMap<u32, (Vec3, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = HashMap::new();
             let mut box_insts: Vec<(Vec3, Quat, Vec3, [f32; 4])> = Vec::new();
-            let start = cam_track_bg.lock().unwrap().0;
+
+            // 1. Exact instance deduplication (eliminates duplicates from overlapping 0DRPz boundary chunks)
+            let mut seen_exact = HashSet::new();
+            let mut hd_ents = Vec::new();
+            let mut lod_ents = Vec::new();
+            let mut slod_ents = Vec::new();
+
             for e in &ix.entities {
                 let p = Vec3::from_array(e.pos);
                 if !p.is_finite() || !e.scale_xy.is_finite() || !e.scale_z.is_finite() {
                     continue;
                 }
+                if !ix.models.contains_key(&e.archetype_hash) {
+                    continue;
+                }
                 let q_raw = Quat::from_xyzw(e.rot[0], e.rot[1], e.rot[2], e.rot[3]);
-                // e.rot is already conjugated to world space in mapdata.rs
                 let q = if !q_raw.is_finite() || q_raw.length_squared() < 1e-6 {
                     Quat::IDENTITY
                 } else {
                     q_raw.normalize()
                 };
-                if !ix.models.contains_key(&e.archetype_hash) {
-                    if p.distance_squared(start) <= 2200.0 * 2200.0 && box_insts.len() < 12_000 {
-                        let h = e.archetype_hash;
-                        let r = 0.45 + ((h & 0xFF) as f32 / 255.0) * 0.45;
-                        let g = 0.45 + (((h >> 8) & 0xFF) as f32 / 255.0) * 0.45;
-                        let b = 0.50 + (((h >> 16) & 0xFF) as f32 / 255.0) * 0.45;
-                        box_insts.push((p, q, Vec3::new(14.0 * e.scale_xy, 14.0 * e.scale_xy, 18.0 * e.scale_z), [r, g, b, 1.0]));
-                    }
+                let sc = Vec3::new(e.scale_xy, e.scale_xy, e.scale_z);
+
+                let key = (e.archetype_hash, (p.x * 2.0).round() as i32, (p.y * 2.0).round() as i32, (p.z * 2.0).round() as i32);
+                if !seen_exact.insert(key) {
                     continue;
                 }
-                let sc = Vec3::new(e.scale_xy, e.scale_xy, e.scale_z);
-                let entry = grouped.entry(e.archetype_hash).or_insert_with(|| (p, Vec::new()));
+
+                if ix.slod_models.contains(&e.archetype_hash) {
+                    slod_ents.push((e.archetype_hash, p, q, sc));
+                } else if ix.lod_models.contains(&e.archetype_hash) || e.child_lod_dist > 0.0 {
+                    lod_ents.push((e.archetype_hash, p, q, sc));
+                } else {
+                    hd_ents.push((e.archetype_hash, p, q, sc));
+                }
+            }
+
+            // 2. Spatial grids for hierarchy suppression
+            // HD grid (10m cells) to suppress overlapping LOD shells
+            let mut hd_grid: HashMap<(i32, i32), Vec<Vec3>> = HashMap::new();
+            for &(_arch, p, _, _) in &hd_ents {
+                let k = ((p.x / 10.0).floor() as i32, (p.y / 10.0).floor() as i32);
+                hd_grid.entry(k).or_default().push(p);
+            }
+
+            // 3. Clean LODs: suppress LOD if HD model exists within 8m; dedup LODs within 2m
+            let mut clean_lods = Vec::new();
+            let mut lod_seen_pos: HashSet<(i32, i32, i32)> = HashSet::new();
+            for (arch, p, q, sc) in lod_ents {
+                let lk = ((p.x / 2.0).round() as i32, (p.y / 2.0).round() as i32, (p.z / 3.0).round() as i32);
+                if !lod_seen_pos.insert(lk) {
+                    continue;
+                }
+                let gx = (p.x / 10.0).floor() as i32;
+                let gy = (p.y / 10.0).floor() as i32;
+                let mut has_hd = false;
+                'check_hd: for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        if let Some(pts) = hd_grid.get(&(gx + dx, gy + dy)) {
+                            for &hp in pts {
+                                if (hp - p).length_squared() < 64.0 { // 8m in 3D
+                                    has_hd = true;
+                                    break 'check_hd;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !has_hd {
+                    clean_lods.push((arch, p, q, sc));
+                }
+            }
+
+            // 4. Building grid (30m cells) containing HD + clean LODs to suppress SLOD shells
+            let mut building_grid: HashMap<(i32, i32), Vec<Vec3>> = HashMap::new();
+            for &(_arch, p, _, _) in hd_ents.iter().chain(clean_lods.iter()) {
+                let k = ((p.x / 30.0).floor() as i32, (p.y / 30.0).floor() as i32);
+                building_grid.entry(k).or_default().push(p);
+            }
+
+            // 5. Clean SLODs: suppress SLOD composite shells if HD or LOD buildings exist within 35m
+            let mut clean_slods = Vec::new();
+            let mut slod_seen_pos: HashSet<(i32, i32)> = HashSet::new();
+            for (arch, p, q, sc) in slod_ents {
+                let sk = ((p.x / 6.0).round() as i32, (p.y / 6.0).round() as i32);
+                if !slod_seen_pos.insert(sk) {
+                    continue;
+                }
+                let gx = (p.x / 30.0).floor() as i32;
+                let gy = (p.y / 30.0).floor() as i32;
+                let mut has_building = false;
+                'check_b: for dx in -2..=2 {
+                    for dy in -2..=2 {
+                        if let Some(pts) = building_grid.get(&(gx + dx, gy + dy)) {
+                            for &bp in pts {
+                                let dx_f = bp.x - p.x;
+                                let dy_f = bp.y - p.y;
+                                if dx_f * dx_f + dy_f * dy_f < 1225.0 { // 35m in 2D
+                                    has_building = true;
+                                    break 'check_b;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !has_building {
+                    clean_slods.push((arch, p, q, sc));
+                }
+            }
+
+            // Populate grouped instances from final clean list
+            for (arch, p, q, sc) in hd_ents.into_iter().chain(clean_lods.into_iter()).chain(clean_slods.into_iter()) {
+                let entry = grouped.entry(arch).or_insert_with(|| (p, Vec::new()));
                 entry.1.push((p, q, sc, [1.0; 4]));
             }
+
+            // 6. Generate debug placeholder boxes ONLY for unmodeled entities far away from buildings (>20m)
+            for e in &ix.entities {
+                if ix.models.contains_key(&e.archetype_hash) || e.child_lod_dist > 0.0 {
+                    continue;
+                }
+                let p = Vec3::from_array(e.pos);
+                if !p.is_finite() || !e.scale_xy.is_finite() || !e.scale_z.is_finite() {
+                    continue;
+                }
+                let gx = (p.x / 30.0).floor() as i32;
+                let gy = (p.y / 30.0).floor() as i32;
+                let mut near_building = false;
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        if let Some(pts) = building_grid.get(&(gx + dx, gy + dy)) {
+                            for &bp in pts {
+                                let dx_f = bp.x - p.x;
+                                let dy_f = bp.y - p.y;
+                                if dx_f * dx_f + dy_f * dy_f < 400.0 { // 20m
+                                    near_building = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if near_building { break; }
+                    }
+                    if near_building { break; }
+                }
+                if near_building || box_insts.len() >= 2_000 {
+                    continue;
+                }
+                let q_raw = Quat::from_xyzw(e.rot[0], e.rot[1], e.rot[2], e.rot[3]);
+                let q = if !q_raw.is_finite() || q_raw.length_squared() < 1e-6 { Quat::IDENTITY } else { q_raw.normalize() };
+                let h = e.archetype_hash;
+                let r = 0.45 + ((h & 0xFF) as f32 / 255.0) * 0.45;
+                let g = 0.45 + (((h >> 8) & 0xFF) as f32 / 255.0) * 0.45;
+                let b = 0.50 + (((h >> 16) & 0xFF) as f32 / 255.0) * 0.45;
+                box_insts.push((p, q, Vec3::new(3.0 * e.scale_xy, 3.0 * e.scale_xy, 3.0 * e.scale_z), [r, g, b, 1.0]));
+            }
+
+            log_world(format!("[world-gpu] Clean world ready: {} unique archetypes after HD/LOD/SLOD hierarchy deduplication", grouped.len()));
             if !box_insts.is_empty() {
                 let bmesh = Mesh3D::from_parts(
                     "__placeholder_boxes__".into(),
@@ -264,40 +504,48 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                 v.sort_unstable();
                 v.dedup();
             }
-            eprintln!("[world-gpu] {} unique drawable archetypes across {} 200m cells indexed for live streaming", all_groups.len(), stream_grid.len());
+            log_world(format!("[world-gpu] {} unique drawable archetypes across {} 200m cells indexed for live streaming", all_groups.len(), stream_grid.len()));
 
             let mut loaded = std::collections::HashSet::<u32>::new();
             let mut last_gen = 0u64;
             loop {
                 let (cam_p, cur_gen) = *cam_track_bg.lock().unwrap();
-                if cur_gen == last_gen {
+                let (stream_radius, vram_pressure) = {
+                    let mut sc = stream_ctl_bg.lock().unwrap();
+                    let evicted = std::mem::take(&mut sc.evicted_hashes);
+                    for h in evicted {
+                        loaded.remove(&h);
+                    }
+                    (sc.stream_radius, sc.vram_pressure)
+                };
+
+                if loaded.len() >= all_groups.len() && cur_gen == last_gen && !vram_pressure {
                     std::thread::sleep(std::time::Duration::from_millis(80));
                     continue;
                 }
                 last_gen = cur_gen;
-                let max_r = 6000.0f32;
-                let cr = (max_r / STREAM_CELL).ceil() as i32;
-                let cx0 = (cam_p.x / STREAM_CELL).floor() as i32;
-                let cy0 = (cam_p.y / STREAM_CELL).floor() as i32;
-                let mut cells: Vec<((i32, i32), f32)> = Vec::new();
-                for dx in -cr..=cr {
-                    for dy in -cr..=cr {
-                        let key = (cx0 + dx, cy0 + dy);
-                        if !stream_grid.contains_key(&key) {
-                            continue;
-                        }
-                        let x0 = key.0 as f32 * STREAM_CELL;
-                        let y0 = key.1 as f32 * STREAM_CELL;
-                        let rx = (x0 - cam_p.x).max(0.0).max(cam_p.x - (x0 + STREAM_CELL));
-                        let ry = (y0 - cam_p.y).max(0.0).max(cam_p.y - (y0 + STREAM_CELL));
-                        let d2 = rx * rx + ry * ry;
-                        if d2 <= max_r * max_r {
-                            cells.push((key, d2));
-                        }
-                    }
-                }
+
+                let max_d2 = stream_radius * stream_radius;
+                let mut cells: Vec<((i32, i32), f32)> = stream_grid.keys().map(|&key| {
+                    let x0 = key.0 as f32 * STREAM_CELL;
+                    let y0 = key.1 as f32 * STREAM_CELL;
+                    let rx = (x0 - cam_p.x).max(0.0).max(cam_p.x - (x0 + STREAM_CELL));
+                    let ry = (y0 - cam_p.y).max(0.0).max(cam_p.y - (y0 + STREAM_CELL));
+                    (key, rx * rx + ry * ry)
+                })
+                .filter(|&(_, d2)| d2 <= max_d2)
+                .collect();
                 cells.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
-                let take_n = if loaded.is_empty() { 1200 } else { 500 };
+
+                let take_n = if vram_pressure {
+                    80
+                } else if loaded.is_empty() {
+                    2500
+                } else if stream_radius <= 3000.0 {
+                    300
+                } else {
+                    1200
+                };
                 let mut seen_idx = std::collections::HashSet::new();
                 let mut batch_list: Vec<(u32, u64, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = Vec::with_capacity(take_n);
                 'outer: for (key, _) in cells {
@@ -315,12 +563,13 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                     }
                 }
                 if batch_list.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
                     continue;
                 }
                 let _ = tx.send(WorldStreamMsg::TotalArchetypes(loaded.len() + batch_list.len()));
                 let groups = Arc::new(batch_list);
                 let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let workers = std::thread::available_parallelism().map(|n| (n.get() / 2).clamp(3, 6)).unwrap_or(3);
+                let workers = std::thread::available_parallelism().map(|n| n.get().clamp(4, 16)).unwrap_or(4);
                 // a camera move stops the batch early and whatever was not reached is queued again
                 let mut finished_count = 0usize;
                 let worker_done: Vec<Vec<u32>> = std::thread::scope(|s| {
@@ -332,8 +581,7 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                             let lp = lp.clone();
                             let cam_track_bg = Arc::clone(&cam_track_bg);
                             s.spawn(move || {
-                                // the viewer shows these at 128 pixels so larger mips are never read
-                                crate::tex::set_thread_texture_cap(128);
+                                crate::tex::set_thread_texture_cap(4096);
                                 let mut local_done = Vec::new();
                                 loop {
                                     if cam_track_bg.lock().unwrap().1 != last_gen {
@@ -344,9 +592,17 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                                         break;
                                     }
                                     let (h, moff, ref insts) = groups[i];
-                                    if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {
+                                    if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf_lod_opt(&lp, moff, &format!("arch_{h:08x}"), 0, false) {
                                         let lo = mesh.name.to_ascii_lowercase();
-                                        if !(lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy"))
+                                        let is_helper = lo.contains("_col.") || lo.ends_with("_col")
+                                            || lo.contains("_collision")
+                                            || lo.contains("_camera_collision")
+                                            || lo.contains("_player_only_col")
+                                            || lo.contains("_shadow")
+                                            || lo.contains("_pxy")
+                                            || lo.contains("_lit_proxy")
+                                            || lo.contains("_occl");
+                                        if !is_helper
                                             && tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts.clone() })).is_err() {
                                                 break;
                                             }
@@ -375,6 +631,7 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
         });
     }
     let mut app = GpuWorldApp::new(cfg, rx, cam_track);
+    app.stream_ctl = Some(stream_ctl);
     event_loop.run_app(&mut app).map_err(|e| format!("GPU event loop failed: {e}"))?;
     match app.failure { Some(error) => Err(error), None => Ok(()) }
 }
@@ -669,6 +926,21 @@ fn fs_progress(in: ProgOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+#[derive(Clone, Debug)]
+struct LoadedArchetype {
+    _hash: u32,
+    geom_bytes: usize,
+    unshared_tex_bytes: usize,
+    tri_count: usize,
+    instance_count: usize,
+    tex_keys: Vec<usize>,
+    center: Vec3,
+    radius: f32,
+    is_terrain: bool,
+    is_road: bool,
+    _is_box: bool,
+}
+
 struct GpuMeshBatch {
     vb: wgpu::Buffer,
     ib: wgpu::Buffer,
@@ -684,6 +956,8 @@ struct GpuMeshBatch {
     obj_radius: f32,
     is_box: bool,
     is_terrain: bool,
+    is_road: bool,
+    archetype_hash: u32,
 }
 
 struct GpuState {
@@ -701,6 +975,9 @@ struct GpuState {
     tex_bgl: wgpu::BindGroupLayout,
     tex_samp: wgpu::Sampler,
     white_bg: wgpu::BindGroup,
+    land_bg: wgpu::BindGroup,
+    road_bg: wgpu::BindGroup,
+    sidewalk_bg: wgpu::BindGroup,
     shadow_pipeline: wgpu::RenderPipeline,
     main_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
@@ -718,10 +995,18 @@ struct GpuState {
     stream_total: usize,
     tex_bytes: usize,
     geom_bytes: usize,
-    vram_oom: bool,
+    _vram_oom: bool,
     // texture bind groups by pixel buffer address with the textures kept alive behind them
     tex_uploads: HashMap<usize, wgpu::BindGroup>,
-    tex_keep: Vec<Arc<crate::model3d::Texture2D>>,
+    tex_ref_counts: HashMap<usize, usize>,
+    tex_sizes: HashMap<usize, usize>,
+    tex_keep: HashMap<usize, Arc<crate::model3d::Texture2D>>,
+    vram_budget_bytes: usize,
+    is_evicting: bool,
+    eviction_count: usize,
+    last_cam_pos: Vec3,
+    loaded_archetypes: HashMap<u32, LoadedArchetype>,
+    pending_evicted: Vec<u32>,
     frame_idx: u64,
     start_instant: Instant,
     has_hw_rt: bool,
@@ -750,7 +1035,7 @@ fn upload_texture(
     samp: &wgpu::Sampler,
     tex: &Texture2D,
     max_dim: usize,
-) -> (wgpu::BindGroup, usize) {
+) -> Option<(wgpu::BindGroup, usize)> {
     let w0 = tex.w.max(1);
     let h0 = tex.h.max(1);
     let scale = (w0.max(h0) + max_dim - 1) / max_dim.max(1);
@@ -774,6 +1059,7 @@ fn upload_texture(
         (w0, h0, buf)
     };
     let bytes = raw.len();
+    device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let gpu_tex = device.create_texture_with_data(
         queue,
         &wgpu::TextureDescriptor {
@@ -789,6 +1075,10 @@ fn upload_texture(
         wgpu::util::TextureDataOrder::LayerMajor,
         &raw,
     );
+    if let Some(err) = pollster_block_on(device.pop_error_scope()) {
+        log_world(format!("[world-gpu] Texture upload OOM ({w}x{h}, {} KiB): {err}", raw.len() / 1024));
+        return None;
+    }
     let view = gpu_tex.create_view(&wgpu::TextureViewDescriptor::default());
     let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("tex_bg"),
@@ -798,7 +1088,7 @@ fn upload_texture(
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(samp) },
         ],
     });
-    (bg, bytes)
+    Some((bg, bytes))
 }
 
 fn compute_smooth_normals(mesh: &Mesh3D) -> Vec<[f32; 3]> {
@@ -843,7 +1133,7 @@ impl GpuState {
             &wgpu::DeviceDescriptor {
                 label: Some("percystar_world_device"),
                 required_features: req_features,
-                required_limits: wgpu::Limits::default(),
+                required_limits: adapter.limits(),
                 memory_hints: Default::default(),
             },
             None,
@@ -1121,8 +1411,33 @@ impl GpuState {
         });
 
         let white_tex = Texture2D::new(1, 1, vec![eframe::egui::Color32::from_rgb(190, 195, 205)]);
-        let (white_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex, 256);
-        let (minimap_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex, 256);
+        let (white_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex, 256).unwrap();
+        let (minimap_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex, 256).unwrap();
+
+        let land_tex = Texture2D::new(4, 4, vec![
+            eframe::egui::Color32::from_rgb(58, 88, 42), eframe::egui::Color32::from_rgb(52, 82, 38), eframe::egui::Color32::from_rgb(63, 93, 46), eframe::egui::Color32::from_rgb(55, 85, 40),
+            eframe::egui::Color32::from_rgb(60, 90, 44), eframe::egui::Color32::from_rgb(50, 80, 36), eframe::egui::Color32::from_rgb(57, 87, 41), eframe::egui::Color32::from_rgb(65, 95, 48),
+            eframe::egui::Color32::from_rgb(53, 83, 39), eframe::egui::Color32::from_rgb(62, 92, 45), eframe::egui::Color32::from_rgb(56, 86, 42), eframe::egui::Color32::from_rgb(51, 81, 37),
+            eframe::egui::Color32::from_rgb(59, 89, 43), eframe::egui::Color32::from_rgb(54, 84, 40), eframe::egui::Color32::from_rgb(61, 91, 46), eframe::egui::Color32::from_rgb(57, 87, 41),
+        ]);
+        let (land_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &land_tex, 256).unwrap();
+
+        let road_tex = Texture2D::new(4, 4, vec![
+            eframe::egui::Color32::from_rgb(34, 35, 38), eframe::egui::Color32::from_rgb(38, 39, 43), eframe::egui::Color32::from_rgb(32, 33, 36), eframe::egui::Color32::from_rgb(36, 37, 41),
+            eframe::egui::Color32::from_rgb(39, 40, 44), eframe::egui::Color32::from_rgb(31, 32, 35), eframe::egui::Color32::from_rgb(37, 38, 42), eframe::egui::Color32::from_rgb(35, 36, 40),
+            eframe::egui::Color32::from_rgb(33, 34, 37), eframe::egui::Color32::from_rgb(37, 38, 42), eframe::egui::Color32::from_rgb(35, 36, 39), eframe::egui::Color32::from_rgb(38, 39, 43),
+            eframe::egui::Color32::from_rgb(36, 37, 40), eframe::egui::Color32::from_rgb(32, 33, 36), eframe::egui::Color32::from_rgb(39, 40, 44), eframe::egui::Color32::from_rgb(34, 35, 38),
+        ]);
+        let (road_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &road_tex, 256).unwrap();
+
+        let sidewalk_tex = Texture2D::new(4, 4, vec![
+            eframe::egui::Color32::from_rgb(175, 170, 160), eframe::egui::Color32::from_rgb(168, 163, 153), eframe::egui::Color32::from_rgb(172, 167, 157), eframe::egui::Color32::from_rgb(180, 175, 165),
+            eframe::egui::Color32::from_rgb(165, 160, 150), eframe::egui::Color32::from_rgb(178, 173, 163), eframe::egui::Color32::from_rgb(170, 165, 155), eframe::egui::Color32::from_rgb(174, 169, 159),
+            eframe::egui::Color32::from_rgb(172, 167, 157), eframe::egui::Color32::from_rgb(169, 164, 154), eframe::egui::Color32::from_rgb(176, 171, 161), eframe::egui::Color32::from_rgb(167, 162, 152),
+            eframe::egui::Color32::from_rgb(177, 172, 162), eframe::egui::Color32::from_rgb(171, 166, 156), eframe::egui::Color32::from_rgb(166, 161, 151), eframe::egui::Color32::from_rgb(173, 168, 158),
+        ]);
+        let (sidewalk_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &sidewalk_tex, 256).unwrap();
+
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
 
         let mut st = Self {
@@ -1140,6 +1455,9 @@ impl GpuState {
             tex_bgl,
             tex_samp,
             white_bg,
+            land_bg,
+            road_bg,
+            sidewalk_bg,
             shadow_pipeline,
             main_pipeline,
             sky_pipeline,
@@ -1157,9 +1475,17 @@ impl GpuState {
             stream_total: 0,
             tex_bytes: 0,
             geom_bytes: 0,
-            vram_oom: false,
+            _vram_oom: false,
             tex_uploads: HashMap::new(),
-            tex_keep: Vec::new(),
+            tex_ref_counts: HashMap::new(),
+            tex_sizes: HashMap::new(),
+            tex_keep: HashMap::new(),
+            vram_budget_bytes: DEFAULT_VRAM_BUDGET_BYTES,
+            is_evicting: false,
+            eviction_count: 0,
+            last_cam_pos: Vec3::from_array(cfg.start_pos),
+            loaded_archetypes: HashMap::new(),
+            pending_evicted: Vec::new(),
             frame_idx: 0,
             start_instant: Instant::now(),
             has_hw_rt,
@@ -1170,11 +1496,12 @@ impl GpuState {
         if let Some(ref terrain) = cfg.terrain {
             st.map_min = [terrain.bmin[0], terrain.bmin[1]];
             st.map_span = [terrain.bmax[0] - terrain.bmin[0], terrain.bmax[1] - terrain.bmin[1]];
-            let tmesh = terrain.build_world_terrain_mesh(8);
+            let tmesh = terrain.build_world_terrain_mesh(4);
             if let Some(ref t) = tmesh.texture {
-                let (mbg, bytes) = upload_texture(&st.device, &st.queue, &st.tex_bgl, &st.tex_samp, t, 1024);
-                st.minimap_bg = mbg;
-                st.tex_bytes += bytes;
+                if let Some((mbg, bytes)) = upload_texture(&st.device, &st.queue, &st.tex_bgl, &st.tex_samp, t, 1024) {
+                    st.minimap_bg = mbg;
+                    st.tex_bytes += bytes;
+                }
             }
             st.add_batch(&WorldBatchInput {
                 mesh: tmesh,
@@ -1194,15 +1521,24 @@ impl GpuState {
         if b.mesh.verts.is_empty() || b.mesh.tris.is_empty() || b.instances.is_empty() {
             return;
         }
-        const MAX_GEOM_BYTES: usize = 1024 * 1024 * 1024;
         let is_terrain = b.mesh.name == "mhiu_world_terrain";
+        let is_road = b.mesh.name.starts_with("nav_") || b.mesh.name.contains("road") || b.mesh.name.contains("street");
+        let arch_hash = archetype_hash_from_mesh_name(&b.mesh.name);
         let use_u16 = b.mesh.verts.len() <= u16::MAX as usize;
         let idx_fmt = if use_u16 { wgpu::IndexFormat::Uint16 } else { wgpu::IndexFormat::Uint32 };
         let est_geom_bytes = b.mesh.verts.len() * std::mem::size_of::<GpuVertex>()
             + b.mesh.tris.len() * if use_u16 { 6 } else { 12 }
             + b.instances.len() * std::mem::size_of::<GpuInstance>();
-        if !is_terrain && (self.vram_oom || self.geom_bytes.saturating_add(est_geom_bytes) > MAX_GEOM_BYTES) {
-            return;
+
+        // Check active VRAM budget and proactively prune if approaching capacity
+        if !is_terrain && (self.geom_bytes + self.tex_bytes + est_geom_bytes > self.vram_budget_bytes) {
+            let bytes_to_free = (self.geom_bytes + self.tex_bytes + est_geom_bytes)
+                .saturating_sub((self.vram_budget_bytes as f32 * 0.75) as usize);
+            let evicted = self.prune_distant_batches(self.last_cam_pos, bytes_to_free);
+            self.pending_evicted.extend(evicted);
+            if self.geom_bytes + self.tex_bytes + est_geom_bytes > self.vram_budget_bytes {
+                return;
+            }
         }
 
         let normals = compute_smooth_normals(&b.mesh);
@@ -1233,7 +1569,7 @@ impl GpuState {
             .map(|(i, &pos)| GpuVertex {
                 pos,
                 normal: normals[i],
-                uv: b.mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+                uv: b.mesh.uvs.get(i).copied().unwrap_or([pos[0] * 0.15, pos[1] * 0.15]),
             })
             .collect();
 
@@ -1267,12 +1603,13 @@ impl GpuState {
             ibs.push((g, indices.len() as u32, ib));
         }
         if let Some(err) = pollster_block_on(self.device.pop_error_scope()) {
-            self.vram_oom = true;
-            eprintln!(
-                "[world-gpu] GPU VRAM limit reached ({} MiB geom, {} MiB tex): {err}",
+            log_world(format!(
+                "[world-gpu] GPU VRAM allocation limit reached ({} MiB geom, {} MiB tex): {err}. Pruning distant meshes to recover...",
                 self.geom_bytes / (1024 * 1024),
                 self.tex_bytes / (1024 * 1024)
-            );
+            ));
+            let evicted = self.prune_distant_batches(self.last_cam_pos, 600 * 1024 * 1024);
+            self.pending_evicted.extend(evicted);
             return;
         }
 
@@ -1307,28 +1644,65 @@ impl GpuState {
             start = end;
         }
 
+        let mut arch_tex_keys = Vec::new();
+        let mut arch_unshared_tex_bytes = 0usize;
+
         for (g, index_count, ib) in ibs {
             let shared = if b.mesh.texture.is_some() { None } else { b.mesh.geom_materials.get(g as usize).and_then(|m| m.texture.clone()) };
             let tex = b.mesh.texture.as_ref().or(shared.as_deref());
             let tex_bg = match tex {
-                Some(t) if self.tex_bytes < 512 * 1024 * 1024 => {
-                    // materials that share a decoded texture share one upload
+                Some(t) if self.geom_bytes + self.tex_bytes < self.vram_budget_bytes => {
                     let key = t.pixels.as_ptr() as usize;
-                    match self.tex_uploads.get(&key).filter(|_| shared.is_some()) {
-                        Some(bg) => bg.clone(),
-                        None => {
-                            let (bg, bytes) = upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t, 128);
-                            self.tex_bytes += bytes;
-                            if let Some(keep) = shared.clone() {
-                                // holding the texture keeps its address from being reused by another one
-                                self.tex_keep.push(keep);
-                                self.tex_uploads.insert(key, bg.clone());
+                    if shared.is_some() {
+                        arch_tex_keys.push(key);
+                        match self.tex_uploads.get(&key) {
+                            Some(bg) => {
+                                *self.tex_ref_counts.entry(key).or_default() += 1;
+                                bg.clone()
                             }
-                            bg
+                            None => {
+                                match upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t, 4096) {
+                                    Some((bg, bytes)) => {
+                                        self.tex_bytes += bytes;
+                                        self.tex_sizes.insert(key, bytes);
+                                        *self.tex_ref_counts.entry(key).or_default() += 1;
+                                        if let Some(keep) = shared.clone() {
+                                            self.tex_keep.insert(key, keep);
+                                            self.tex_uploads.insert(key, bg.clone());
+                                        }
+                                        bg
+                                    }
+                                    None => {
+                                        self.white_bg.clone()
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        match upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t, 4096) {
+                            Some((bg, bytes)) => {
+                                self.tex_bytes += bytes;
+                                arch_unshared_tex_bytes += bytes;
+                                bg
+                            }
+                            None => {
+                                self.white_bg.clone()
+                            }
                         }
                     }
                 }
-                _ => self.white_bg.clone(),
+                _ => {
+                    let m_name = b.mesh.name.to_ascii_lowercase();
+                    if g == 2 || m_name.contains("road") || m_name.contains("street") || m_name.contains("highway") {
+                        self.road_bg.clone()
+                    } else if g == 3 || m_name.contains("sidewalk") || m_name.contains("pavement") || m_name.contains("curb") {
+                        self.sidewalk_bg.clone()
+                    } else if g == 0 && (m_name.starts_with("nav_") || is_terrain) {
+                        self.land_bg.clone()
+                    } else {
+                        self.white_bg.clone()
+                    }
+                }
             };
 
             for &(inst_first, inst_count, bound_center, bound_radius, obj_radius) in &cells {
@@ -1346,14 +1720,124 @@ impl GpuState {
                     obj_radius,
                     is_box: b.mesh.name == "__placeholder_boxes__",
                     is_terrain,
+                    is_road,
+                    archetype_hash: arch_hash,
                 });
             }
         }
+
+        let (arch_center, arch_radius) = if cells.is_empty() {
+            (Vec3::ZERO, 100.0)
+        } else {
+            let mut min_p = Vec3::splat(f32::MAX);
+            let mut max_p = Vec3::splat(f32::MIN);
+            for &(_, _, c, r, _) in &cells {
+                min_p = min_p.min(c - Vec3::splat(r));
+                max_p = max_p.max(c + Vec3::splat(r));
+            }
+            let c = (min_p + max_p) * 0.5;
+            let r = ((max_p - min_p) * 0.5).length().max(1.0);
+            (c, r)
+        };
+        arch_tex_keys.sort_unstable();
+        arch_tex_keys.dedup();
+        self.loaded_archetypes.insert(arch_hash, LoadedArchetype {
+            _hash: arch_hash,
+            geom_bytes: est_geom_bytes,
+            unshared_tex_bytes: arch_unshared_tex_bytes,
+            tri_count: b.mesh.tris.len() * insts.len(),
+            instance_count: insts.len(),
+            tex_keys: arch_tex_keys,
+            center: arch_center,
+            radius: arch_radius,
+            is_terrain,
+            is_road,
+            _is_box: b.mesh.name == "__placeholder_boxes__",
+        });
 
         self.geom_bytes += est_geom_bytes;
         self.tri_count += b.mesh.tris.len() * insts.len();
         self.instance_count += insts.len();
         self.model_count += 1;
+    }
+
+    pub fn prune_distant_batches(&mut self, cam_pos: Vec3, bytes_to_free: usize) -> Vec<u32> {
+        if bytes_to_free == 0 || self.loaded_archetypes.is_empty() {
+            return Vec::new();
+        }
+        self.is_evicting = true;
+        const MIN_EVICT_DIST: f32 = 450.0; // preserve meshes within close range (300m - 500m)
+
+        let mut candidates: Vec<(u32, f32, usize)> = self.loaded_archetypes
+            .iter()
+            .filter(|(_, arch)| !arch.is_terrain && !arch.is_road)
+            .map(|(&h, arch)| {
+                let dist = ((arch.center - cam_pos).length() - arch.radius).max(0.0);
+                let est_bytes = arch.geom_bytes + arch.unshared_tex_bytes;
+                (h, dist, est_bytes)
+            })
+            .filter(|&(_, dist, _)| dist >= MIN_EVICT_DIST)
+            .collect();
+
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        let mut evicted = Vec::new();
+        let mut freed_bytes = 0usize;
+        let mut hashes_to_remove = HashSet::new();
+
+        for (h, _dist, est_bytes) in candidates {
+            hashes_to_remove.insert(h);
+            evicted.push(h);
+            freed_bytes += est_bytes;
+            if freed_bytes >= bytes_to_free {
+                break;
+            }
+        }
+
+        if evicted.is_empty() {
+            self.is_evicting = false;
+            return Vec::new();
+        }
+
+        self.batches.retain(|b| !hashes_to_remove.contains(&b.archetype_hash));
+
+        for &h in &evicted {
+            if let Some(arch) = self.loaded_archetypes.remove(&h) {
+                self.geom_bytes = self.geom_bytes.saturating_sub(arch.geom_bytes);
+                self.tex_bytes = self.tex_bytes.saturating_sub(arch.unshared_tex_bytes);
+                self.tri_count = self.tri_count.saturating_sub(arch.tri_count);
+                self.instance_count = self.instance_count.saturating_sub(arch.instance_count);
+                self.model_count = self.model_count.saturating_sub(1);
+
+                for key in arch.tex_keys {
+                    let should_remove = if let Some(rc) = self.tex_ref_counts.get_mut(&key) {
+                        *rc = rc.saturating_sub(1);
+                        *rc == 0
+                    } else {
+                        false
+                    };
+                    if should_remove {
+                        self.tex_ref_counts.remove(&key);
+                        self.tex_uploads.remove(&key);
+                        self.tex_keep.remove(&key);
+                        if let Some(tbytes) = self.tex_sizes.remove(&key) {
+                            self.tex_bytes = self.tex_bytes.saturating_sub(tbytes);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.eviction_count += evicted.len();
+        log_world(format!(
+            "[world-gpu] VRAM budget: pruned {} distant archetypes, freed ~{} MiB (active VRAM: {} MiB geom, {} MiB tex)",
+            evicted.len(),
+            freed_bytes / (1024 * 1024),
+            self.geom_bytes / (1024 * 1024),
+            self.tex_bytes / (1024 * 1024)
+        ));
+        self.is_evicting = false;
+        evicted
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -1373,6 +1857,7 @@ struct GpuWorldApp {
     terrain_ref: Option<Arc<WorldMapData>>,
     stream_rx: Receiver<WorldStreamMsg>,
     cam_track: Arc<std::sync::Mutex<(Vec3, u64)>>,
+    stream_ctl: Option<Arc<std::sync::Mutex<StreamThrottleState>>>,
     last_stream_cam: Vec3,
     gpu: Option<GpuState>,
     egui_ctx: eframe::egui::Context,
@@ -1401,6 +1886,8 @@ struct GpuWorldApp {
     smoke_frames: Option<u32>,
     ready: bool,
     failure: Option<String>,
+    show_console: bool,
+    logs: Vec<String>,
 }
 
 impl GpuWorldApp {
@@ -1412,6 +1899,7 @@ impl GpuWorldApp {
             cfg: Some(cfg),
             stream_rx,
             cam_track,
+            stream_ctl: None,
             gpu: None,
             egui_ctx: eframe::egui::Context::default(),
             egui_events: Vec::new(),
@@ -1424,10 +1912,12 @@ impl GpuWorldApp {
             rt_on: true,
             walk_mode: false,
             menu_open: true,
+            show_console: false,
+            logs: Vec::new(),
             show_models: true,
             show_boxes: false,
             show_water: true,
-            draw_radius: 6000.0,
+            draw_radius: 35000.0,
             fog_density: 0.70,
             exposure: 1.0,
             keys: [false; 9],
@@ -1444,7 +1934,7 @@ impl GpuWorldApp {
     fn sample_terrain_z(&self, x: f32, y: f32) -> f32 {
         let Some(ref t) = self.terrain_ref else { return 0.0 };
         let u = ((x - t.bmin[0]) / (t.bmax[0] - t.bmin[0]).max(1.0)).clamp(0.0, 1.0);
-        let v = (1.0 - (y - t.bmin[1]) / (t.bmax[1] - t.bmin[1]).max(1.0)).clamp(0.0, 1.0);
+        let v = ((y - t.bmin[1]) / (t.bmax[1] - t.bmin[1]).max(1.0)).clamp(0.0, 1.0);
         let ix = ((u * (t.w.saturating_sub(1)) as f32) as usize).min(t.w - 1);
         let iy = ((v * (t.h.saturating_sub(1)) as f32) as usize).min(t.h - 1);
         let h = t.heights[iy * t.w + ix] as f32 / 255.0;
@@ -1562,6 +2052,7 @@ impl ApplicationHandler for GpuWorldApp {
                         KeyCode::Space => self.keys[7] = down,
                         KeyCode::ControlLeft | KeyCode::ControlRight => self.keys[8] = down,
                         KeyCode::Home | KeyCode::F1 if down => self.menu_open = !self.menu_open,
+                        KeyCode::Backquote | KeyCode::KeyL if down => self.show_console = !self.show_console,
                         KeyCode::KeyB if down => self.show_boxes = !self.show_boxes,
                         KeyCode::KeyV if down => self.show_water = !self.show_water,
                         KeyCode::F6 if down => self.auto_sun = !self.auto_sun,
@@ -1581,10 +2072,21 @@ impl ApplicationHandler for GpuWorldApp {
                 let dt = (now - self.last_frame).as_secs_f32().min(0.1);
                 self.last_frame = now;
 
+                if let Ok(mut pending) = WORLD_LOGS.lock() {
+                    if !pending.is_empty() {
+                        self.logs.extend(pending.drain(..));
+                        if self.logs.len() > 400 {
+                            let drop_cnt = self.logs.len() - 400;
+                            self.logs.drain(0..drop_cnt);
+                        }
+                    }
+                }
+
                 if let Some(g) = &mut self.gpu {
+                    g.last_cam_pos = self.cam_pos;
                     let upload_start = Instant::now();
-                    for _ in 0..8 {
-                        if upload_start.elapsed().as_micros() >= 6000 {
+                    for _ in 0..64 {
+                        if upload_start.elapsed().as_micros() >= 12000 {
                             break;
                         }
                         let Ok(msg) = self.stream_rx.try_recv() else { break };
@@ -1593,6 +2095,43 @@ impl ApplicationHandler for GpuWorldApp {
                             WorldStreamMsg::MapCount(mc) => g.map_count = mc,
                             WorldStreamMsg::TotalArchetypes(t) => g.stream_total = t,
                             WorldStreamMsg::ArchetypeDone => g.stream_done += 1,
+                        }
+                    }
+
+                    // Dynamic VRAM budget check & distant batch pruning
+                    let total_vram = g.geom_bytes + g.tex_bytes;
+                    let (target_radius, vram_pressure, _) = compute_throttle_tier(total_vram, g.vram_budget_bytes);
+
+                    let mut evicted = Vec::new();
+                    let ratio = total_vram as f32 / g.vram_budget_bytes as f32;
+                    if ratio >= 0.88 || total_vram >= 5_500 * 1024 * 1024 {
+                        let safe_target = (g.vram_budget_bytes as f32 * 0.75) as usize;
+                        if total_vram > safe_target {
+                            let bytes_to_free = total_vram - safe_target;
+                            evicted = g.prune_distant_batches(self.cam_pos, bytes_to_free);
+                        }
+                    }
+                    evicted.extend(g.pending_evicted.drain(..));
+                    if !evicted.is_empty() {
+                        g.stream_done = g.stream_done.saturating_sub(evicted.len());
+                        if let Some(ref ctl) = self.stream_ctl {
+                            let mut sc = ctl.lock().unwrap();
+                            sc.evicted_hashes.extend(evicted);
+                        }
+                        if let Ok(mut ct) = self.cam_track.lock() {
+                            ct.1 += 1;
+                        }
+                    }
+
+                    if let Some(ref ctl) = self.stream_ctl {
+                        let mut sc = ctl.lock().unwrap();
+                        let rad_diff = (sc.stream_radius - target_radius).abs();
+                        if rad_diff > 25.0 || sc.vram_pressure != vram_pressure {
+                            sc.stream_radius = target_radius;
+                            sc.vram_pressure = vram_pressure;
+                            if let Ok(mut ct) = self.cam_track.lock() {
+                                ct.1 += 1;
+                            }
                         }
                     }
                 }
@@ -1630,7 +2169,7 @@ impl ApplicationHandler for GpuWorldApp {
                     if self.keys[4] { self.cam_pos.z -= speed; }
                 }
 
-                if self.cam_pos.distance_squared(self.last_stream_cam) > 180.0 * 180.0 {
+                if self.cam_pos.distance_squared(self.last_stream_cam) > 60.0 * 60.0 {
                     self.last_stream_cam = self.cam_pos;
                     if let Ok(mut ct) = self.cam_track.lock() {
                         ct.0 = self.cam_pos;
@@ -1647,6 +2186,10 @@ impl ApplicationHandler for GpuWorldApp {
                     self.last_title = now;
                     let rt_lbl = if !self.rt_on { "OFF" } else if g.has_hw_rt { "HW-RT" } else { "SS-RT/GI" };
                     let mode_lbl = if self.walk_mode { "WALK(G)" } else { "FLY(G)" };
+                    let total_vram_gb = (g.geom_bytes + g.tex_bytes) as f32 / (1024.0 * 1024.0 * 1024.0);
+                    let ceiling_gb = g.vram_budget_bytes as f32 / (1024.0 * 1024.0 * 1024.0);
+                    let vram_pct = ((g.geom_bytes + g.tex_bytes) as f32 / g.vram_budget_bytes as f32 * 100.0).clamp(0.0, 100.0);
+                    let (_, _, throttle_lbl) = compute_throttle_tier(g.geom_bytes + g.tex_bytes, g.vram_budget_bytes);
                     let load_lbl = if g.stream_total > 0 && g.stream_done < g.stream_total {
                         format!(" | Load {}/{} ({:.0}%)", g.stream_done, g.stream_total, (g.stream_done as f32 / g.stream_total as f32) * 100.0)
                     } else if g.stream_total > 0 {
@@ -1655,11 +2198,13 @@ impl ApplicationHandler for GpuWorldApp {
                         " | Indexing...".to_string()
                     };
                     g.window.set_title(&format!(
-                        "PercyStar 3D World | pos {:.0} {:.0} {:.0} | {} | Sun az {:.1} el {:+.1} (F6) | Time {:.2}h | {} maps | {} models | {} instances | {:.2} M tris | RT: {}{}",
+                        "PercyStar 3D World | pos {:.0} {:.0} {:.0} | {} | Sun az {:.1} el {:+.1} (F6) | Time {:.2}h | {} maps | {} models | {} instances | {:.2} M tris | VRAM {:.2}/{:.1}GB ({:.0}%) [{}] | RT: {}{}",
                         self.cam_pos.x, self.cam_pos.y, self.cam_pos.z, mode_lbl,
                         az.to_degrees().rem_euclid(360.0), el.to_degrees(),
                         self.time_h, g.map_count, g.model_count, g.instance_count,
-                        g.tri_count as f64 / 1e6, rt_lbl, load_lbl
+                        g.tri_count as f64 / 1e6,
+                        total_vram_gb, ceiling_gb, vram_pct, throttle_lbl,
+                        rt_lbl, load_lbl
                     ));
                 }
 
@@ -1713,7 +2258,7 @@ impl ApplicationHandler for GpuWorldApp {
                     rp.set_pipeline(&g.shadow_pipeline);
                     rp.set_bind_group(0, &g.uniform_bg, &[]);
                     for b in &g.batches {
-                        if b.obj_radius < 3.0 {
+                        if b.is_road || b.is_terrain || b.obj_radius < 3.0 {
                             continue;
                         }
                         if b.bound_radius < 5000.0 && (b.bound_center - light_target).length_squared() > (1200.0 + b.bound_radius).powi(2) {
@@ -1756,12 +2301,12 @@ impl ApplicationHandler for GpuWorldApp {
                     }
 
                     rp.set_pipeline(&g.main_pipeline);
-                    let mut drawn = 0usize;
+                    let mut _drawn = 0usize;
                     for b in &g.batches {
                         if b.is_box && !self.show_boxes {
                             continue;
                         }
-                        if !b.is_box && !b.is_terrain && !self.show_models {
+                        if !b.is_box && !b.is_terrain && !b.is_road && !self.show_models {
                             continue;
                         }
                         if !b.is_terrain && b.bound_radius < 5000.0 {
@@ -1770,15 +2315,15 @@ impl ApplicationHandler for GpuWorldApp {
                                 continue;
                             }
                             let d2 = to_b.length_squared();
-                            let base_d: f32 = if b.obj_radius > 35.0 { 6500.0 } else if b.obj_radius < 2.0 { 450.0 } else { 3200.0 };
-                            let max_d = base_d.min(self.draw_radius).max(if b.obj_radius > 35.0 { self.draw_radius } else { 450.0 });
+                            let max_d = if b.obj_radius < 1.5 {
+                                1200.0f32.min(self.draw_radius)
+                            } else {
+                                self.draw_radius
+                            };
                             if d2 > (max_d + b.bound_radius).powi(2) {
                                 continue;
                             }
-                            drawn += 1;
-                            if drawn > 6000 {
-                                break;
-                            }
+                            _drawn += 1;
                         }
                         rp.set_bind_group(1, &b.tex_bind_group, &[]);
                         rp.set_vertex_buffer(0, b.vb.slice(..));
@@ -1829,15 +2374,80 @@ impl ApplicationHandler for GpuWorldApp {
                         .default_width(350.0)
                         .resizable(false)
                         .show(ctx, |ui| {
+                            let total_vram_bytes = g.geom_bytes + g.tex_bytes;
+                            let total_vram_gb = total_vram_bytes as f32 / (1024.0 * 1024.0 * 1024.0);
+                            let ceiling_gb = g.vram_budget_bytes as f32 / (1024.0 * 1024.0 * 1024.0);
+                            let vram_pct = (total_vram_bytes as f32 / g.vram_budget_bytes as f32 * 100.0).clamp(0.0, 100.0);
+                            let stream_rad = self.stream_ctl.as_ref().map(|c| c.lock().unwrap().stream_radius).unwrap_or(35000.0);
+                            let (_, _, throttle_lbl) = compute_throttle_tier(total_vram_bytes, g.vram_budget_bytes);
+                            let status_display = if g.is_evicting {
+                                "EVICTING (Pruning Distant Meshes)"
+                            } else {
+                                throttle_lbl
+                            };
+                            let status_color = if g.is_evicting || vram_pct >= 85.0 {
+                                eframe::egui::Color32::from_rgb(255, 75, 75)
+                            } else if vram_pct >= 75.0 {
+                                eframe::egui::Color32::from_rgb(255, 185, 45)
+                            } else if vram_pct >= 55.0 {
+                                eframe::egui::Color32::from_rgb(230, 220, 70)
+                            } else {
+                                eframe::egui::Color32::from_rgb(85, 235, 145)
+                            };
+
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    eframe::egui::RichText::new(format!(
+                                        "VRAM: {:.2} / {:.1} GB ({:.0}%)",
+                                        total_vram_gb, ceiling_gb, vram_pct
+                                    ))
+                                    .strong()
+                                    .size(11.5)
+                                    .color(if vram_pct >= 80.0 {
+                                        eframe::egui::Color32::from_rgb(255, 110, 110)
+                                    } else {
+                                        eframe::egui::Color32::from_rgb(95, 215, 255)
+                                    }),
+                                );
+                                ui.label(
+                                    eframe::egui::RichText::new(format!("• [{status_display}]"))
+                                        .strong()
+                                        .size(11.0)
+                                        .color(status_color),
+                                );
+                            });
                             ui.label(
                                 eframe::egui::RichText::new(format!(
-                                    "{} maps · {}/{} models · {} inst · {:.2}M tris · {} MB VRAM",
-                                    g.map_count, g.model_count, g.stream_total, g.instance_count,
-                                    g.tri_count as f64 / 1e6, g.tex_bytes / (1024 * 1024)
+                                    "  ↳ Geom {}MB · Tex {}MB · Stream {:.0}m",
+                                    g.geom_bytes / (1024 * 1024),
+                                    g.tex_bytes / (1024 * 1024),
+                                    stream_rad,
                                 ))
-                                .size(11.0)
-                                .color(eframe::egui::Color32::from_rgb(95, 215, 255)),
+                                .size(10.5)
+                                .color(eframe::egui::Color32::from_rgb(180, 175, 210)),
                             );
+                            ui.label(
+                                eframe::egui::RichText::new(format!(
+                                    "{} maps · {}/{} models · {} inst · {:.2}M tris",
+                                    g.map_count, g.model_count, g.stream_total, g.instance_count,
+                                    g.tri_count as f64 / 1e6
+                                ))
+                                .size(10.5)
+                                .color(eframe::egui::Color32::from_rgb(150, 150, 180)),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.label("VRAM Budget:");
+                                for (lbl, bytes) in [
+                                    ("4.0 GB", 4000 * 1024 * 1024),
+                                    ("5.5 GB", 5500 * 1024 * 1024),
+                                    ("5.8 GB (Def)", 5800 * 1024 * 1024),
+                                    ("7.5 GB", 7500 * 1024 * 1024),
+                                ] {
+                                    if ui.selectable_label(g.vram_budget_bytes == bytes, lbl).clicked() {
+                                        g.vram_budget_bytes = bytes;
+                                    }
+                                }
+                            });
                             ui.separator();
                             ui.add(eframe::egui::Slider::new(&mut self.time_h, 0.0..=24.0).text("Time of Day (h)"));
                             ui.horizontal(|ui| {
@@ -1850,7 +2460,7 @@ impl ApplicationHandler for GpuWorldApp {
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Radius:");
-                                for (lbl, r) in [("700m", 700.0), ("1.5km", 1500.0), ("3km", 3000.0), ("6km", 6000.0), ("16km", 16000.0)] {
+                                for (lbl, r) in [("1.5km", 1500.0), ("3km", 3000.0), ("6km", 6000.0), ("16km", 16000.0), ("35km (Ultra)", 35000.0)] {
                                     if ui.selectable_label((self.draw_radius - r).abs() < 1.0, lbl).clicked() {
                                         self.draw_radius = r;
                                     }
@@ -1867,6 +2477,7 @@ impl ApplicationHandler for GpuWorldApp {
                                 ui.checkbox(&mut self.show_models, "Real Models");
                                 ui.checkbox(&mut self.show_boxes, "Boxes (B)");
                                 ui.checkbox(&mut self.walk_mode, "Walk (G)");
+                                ui.checkbox(&mut self.show_console, "Console (~ / L)");
                             });
                             ui.horizontal(|ui| {
                                 let btn = eframe::egui::Button::new(
@@ -1887,6 +2498,38 @@ impl ApplicationHandler for GpuWorldApp {
                                 );
                             });
                         });
+                        if self.show_console {
+                            eframe::egui::Window::new("PercyStar Debug Console (~ / L)")
+                                .default_pos([20.0, 480.0])
+                                .default_size([720.0, 260.0])
+                                .resizable(true)
+                                .show(ctx, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Clear").clicked() {
+                                            self.logs.clear();
+                                        }
+                                        if ui.button("Copy All").clicked() {
+                                            ui.ctx().copy_text(self.logs.join("\n"));
+                                        }
+                                        ui.label(format!("{} log lines", self.logs.len()));
+                                    });
+                                    ui.separator();
+                                    eframe::egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                                        for line in &self.logs {
+                                            let color = if line.contains("ERROR") || line.contains("failed") || line.contains("error") {
+                                                eframe::egui::Color32::from_rgb(255, 90, 90)
+                                            } else if line.contains("WARN") || line.contains("limit") {
+                                                eframe::egui::Color32::from_rgb(255, 200, 60)
+                                            } else if line.contains("Streaming") || line.contains("ready") || line.contains("Ready") {
+                                                eframe::egui::Color32::from_rgb(90, 230, 140)
+                                            } else {
+                                                eframe::egui::Color32::from_rgb(220, 220, 230)
+                                            };
+                                            ui.label(eframe::egui::RichText::new(line).monospace().size(11.0).color(color));
+                                        }
+                                    });
+                                });
+                        }
                     });
                     for (id, delta) in &full_out.textures_delta.set {
                         g.egui_renderer.update_texture(&g.device, &g.queue, *id, delta);
@@ -1961,7 +2604,7 @@ fn pollster_block_on<F: std::future::Future>(fut: F) -> F::Output {
 mod terrain_sampling_tests {
     use super::*;
     #[test]
-    fn camera_keeps_configured_start_and_samples_north_to_south() {
+    fn camera_keeps_configured_start_and_samples_south_to_north() {
         let cfg = WorldLaunchConfig {
             terrain: Some(Arc::new(WorldMapData {
                 w: 2,
@@ -1980,8 +2623,8 @@ mod terrain_sampling_tests {
         let start = Vec3::from_array(cfg.start_pos);
         let app = GpuWorldApp::new(cfg, rx, Arc::new(std::sync::Mutex::new((start, 1))));
         assert_eq!(app.cam_pos, start);
-        assert!((app.sample_terrain_z(0.0, 10.0) - 10.0).abs() < 0.001);
-        assert!((app.sample_terrain_z(0.0, -10.0) - 200.0).abs() < 0.001);
+        assert!((app.sample_terrain_z(0.0, -10.0) - 10.0).abs() < 0.001);
+        assert!((app.sample_terrain_z(0.0, 10.0) - 200.0).abs() < 0.001);
     }
 }
 
@@ -1993,5 +2636,59 @@ mod startup_tests {
         let missing = Path::new("target/missing-world-regression.rpf");
         assert!(!missing.exists());
         assert!(run_gpu_world_cli(Some(missing), None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod vram_budget_tests {
+    use super::*;
+
+    #[test]
+    fn vram_throttling_tiers_match_budget_headroom() {
+        let budget = 5800 * 1024 * 1024;
+        // Test <40% usage -> 35km uncapped
+        let (r0, p0, s0) = compute_throttle_tier(1000 * 1024 * 1024, budget);
+        assert_eq!(r0, 35000.0);
+        assert!(!p0);
+        assert!(s0.contains("UNCAPPED"));
+
+        // Test 45% usage -> 6km
+        let (r1, p1, s1) = compute_throttle_tier(2600 * 1024 * 1024, budget);
+        assert_eq!(r1, 6000.0);
+        assert!(!p1);
+        assert!(s1.contains("6km"));
+
+        // Test 60% usage -> 3km
+        let (r2, p2, s2) = compute_throttle_tier(3500 * 1024 * 1024, budget);
+        assert_eq!(r2, 3000.0);
+        assert!(!p2);
+        assert!(s2.contains("3km"));
+
+        // Test 75% usage -> 1.5km
+        let (r3, p3, s3) = compute_throttle_tier(4300 * 1024 * 1024, budget);
+        assert_eq!(r3, 1500.0);
+        assert!(!p3);
+        assert!(s3.contains("1.5km"));
+
+        // Test >80% usage -> 450m close range + pressure
+        let (r4, p4, s4) = compute_throttle_tier(4800 * 1024 * 1024, budget);
+        assert_eq!(r4, 450.0);
+        assert!(p4);
+        assert!(s4.contains("THROTTLED"));
+
+        // Test >88% usage -> 350m close range + critical eviction
+        let (r5, p5, s5) = compute_throttle_tier(5200 * 1024 * 1024, budget);
+        assert_eq!(r5, 350.0);
+        assert!(p5);
+        assert!(s5.contains("CRITICAL"));
+    }
+
+    #[test]
+    fn archetype_hash_extraction_from_mesh_name() {
+        assert_eq!(archetype_hash_from_mesh_name("arch_0001abcd"), 0x0001abcd);
+        assert_eq!(archetype_hash_from_mesh_name("arch_deadbeef"), 0xdeadbeef);
+        assert_eq!(archetype_hash_from_mesh_name("mhiu_world_terrain"), 0);
+        assert_eq!(archetype_hash_from_mesh_name("nav_tile_12_34"), 1);
+        assert_eq!(archetype_hash_from_mesh_name("__placeholder_boxes__"), 2);
     }
 }

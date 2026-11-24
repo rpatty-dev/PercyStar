@@ -1,11 +1,14 @@
 ﻿mod anim;
 mod audio_player;
 mod awc;
+mod bcpack_rans;
 mod bink2;
 mod bink2_container;
 mod boot;
 mod dat;
 mod dxbc;
+mod map_assembler;
+mod props_pipeline;
 mod mapdata;
 mod meta7a;
 mod names;
@@ -640,9 +643,20 @@ fn safe_file_name(name: &str) -> String {
         .chars()
         .map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
         .collect();
-    let cleaned = cleaned.trim().trim_end_matches('.').to_string();
+    let mut cleaned = cleaned.trim().trim_end_matches('.').to_string();
     if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
         return "unnamed".into();
+    }
+    // windows resolves these to devices even with an extension ("con.txt"), so they never become files
+    let stem = cleaned.split('.').next().unwrap_or("");
+    const RESERVED_STEMS: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if RESERVED_STEMS.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
+        // keep the extension: "con.txt" becomes "con_.txt"
+        let pos = cleaned.find('.').unwrap_or(cleaned.len());
+        cleaned.insert(pos, '_');
     }
     cleaned
 }
@@ -6169,84 +6183,7 @@ fn extract_sgd5_cli(src: &Path, out_dir: &Path, limit: usize) {
     }
 }
 
-fn decode_audio_cli(rpf_path: &Path, out_dir: &Path, limit: usize) {
-    let _ = fs::create_dir_all(out_dir);
-    let Ok(mut f) = File::open(rpf_path) else {
-        eprintln!("Failed to open {}", rpf_path.display());
-        return;
-    };
-    let sz = f.metadata().map(|m| m.len()).unwrap_or(0).min(2 * 1024 * 1024 * 1024);
-    let mut off = 0u64;
-    let mut buf = vec![0u8; 16 * 1024 * 1024];
-    let mut banks = Vec::new();
-    while off < sz {
-        let Ok(n) = f.read(&mut buf) else { break };
-        if n == 0 { break; }
-        let mut pos = 0usize;
-        while pos + 16 <= n {
-            if &buf[pos..pos + 4] == b"ADAT" {
-                let sc = u32::from_le_bytes([buf[pos + 8], buf[pos + 9], buf[pos + 10], buf[pos + 11]]);
-                let hdr_sz = u32::from_le_bytes([buf[pos + 12], buf[pos + 13], buf[pos + 14], buf[pos + 15]]);
-                if (1..=256).contains(&sc) && (16..=65536).contains(&hdr_sz) {
-                    banks.push((off + pos as u64, sc));
-                    if limit > 0 && banks.len() >= limit { break; }
-                }
-            }
-            pos += 16;
-        }
-        if limit > 0 && banks.len() >= limit { break; }
-        off += n.saturating_sub(64) as u64;
-        let _ = f.seek(SeekFrom::Start(off));
-    }
-    let mut total_wavs = 0usize;
-    let mut bank_data = vec![0u8; 256 * 1024];
-    for (i, &(bank_off, sc)) in banks.iter().enumerate() {
-        let _ = f.seek(SeekFrom::Start(bank_off));
-        let n = f.read(&mut bank_data).unwrap_or(0);
-        let stem = format!("bank_{i:03}_off_{bank_off:08x}_{sc}st");
-        let res = awc::decode_awc_bytes_to_wavs_detailed(&bank_data[..n], out_dir, &stem);
-        total_wavs += res.wavs.len();
-    }
-    println!("Exported {total_wavs} WAV tracks from {} banks -> {}", banks.len(), out_dir.display());
-}
 
-fn decode_navmesh_cli(rpf_path: &Path, out_dir: &Path, limit: usize) {
-    let _ = fs::create_dir_all(out_dir);
-    let Ok(mut f) = File::open(rpf_path) else {
-        eprintln!("Failed to open {}", rpf_path.display());
-        return;
-    };
-    let base_off = 786_010_112u64;
-    let _ = f.seek(SeekFrom::Start(base_off));
-    let mut buf = vec![0u8; 32 * 1024 * 1024];
-    let n = f.read(&mut buf).unwrap_or(0);
-    let mut dec = Decompress::new(true);
-    let mut out = vec![0u8; 32768];
-    let mut ok = 0usize;
-    let mut pos = 0usize;
-    while pos + 32 <= n {
-        if buf[pos] == 0x78 && matches!(buf[pos + 1], 0x01 | 0x5e | 0x9c | 0xda) {
-            dec.reset(true);
-            let _ = dec.decompress(&buf[pos..(pos + 32768).min(n)], &mut out, FlushDecompress::None);
-            if dec.total_out() >= 0xD0 && u32::from_le_bytes([out[0x14], out[0x15], out[0x16], out[0x17]]) == 0x0001_0015 {
-                let midx = u32::from_le_bytes([out[0xC8], out[0xC9], out[0xCA], out[0xCB]]);
-                let nm = if midx < 512 * 512 {
-                    format!("nav_{:03}_{:03}", midx % 512, midx / 512)
-                } else {
-                    format!("nav_dyn_{midx:06x}")
-                };
-                if let Ok(mesh) = tex::decode_navmesh_from_rpf(rpf_path, base_off + pos as u64, &nm) {
-                    if mesh.export_obj(&out_dir.join(format!("{nm}.obj"))).is_ok() {
-                        ok += 1;
-                        if limit > 0 && ok >= limit { break; }
-                    }
-                }
-            }
-        }
-        pos += 16;
-    }
-    println!("Exported {ok} CNavMesh .obj tiles -> {}", out_dir.display());
-}
 
 fn disassemble_dxbc_cli(src: &Path, output: Option<&PathBuf>) {
     match fs::read(src) {
@@ -6265,7 +6202,295 @@ fn disassemble_dxbc_cli(src: &Path, output: Option<&PathBuf>) {
     }
 }
 
+fn decode_audio_cli(rpf_path: &Path, out_dir: &Path, limit: usize) {
+    let _ = fs::create_dir_all(out_dir);
+    println!("Scanning audio banks from {}...", rpf_path.display());
+    let mut f = match File::open(rpf_path) {
+        Ok(f) => f,
+        Err(e) => { eprintln!("Failed to open {}: {e}", rpf_path.display()); return; }
+    };
+    let sz = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut off = 0u64;
+    let mut buf = vec![0u8; 16 * 1024 * 1024];
+    let mut found_banks = Vec::new();
+    let scan_limit = sz.min(2 * 1024 * 1024 * 1024);
+    while off < scan_limit {
+        let n = match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => { eprintln!("Read error: {e}"); break; }
+        };
+        let mut pos = 0usize;
+        while pos + 16 <= n {
+            if &buf[pos..pos + 4] == b"ADAT" {
+                let abs_off = off + pos as u64;
+                let sc = u32::from_le_bytes([buf[pos + 8], buf[pos + 9], buf[pos + 10], buf[pos + 11]]);
+                let hdr_sz = u32::from_le_bytes([buf[pos + 12], buf[pos + 13], buf[pos + 14], buf[pos + 15]]);
+                if sc > 0 && sc <= 256 && hdr_sz >= 16 && (hdr_sz as usize) <= 65536 {
+                    found_banks.push((abs_off, sc, hdr_sz));
+                    if limit > 0 && found_banks.len() >= limit { break; }
+                }
+            }
+            pos += 16;
+        }
+        if limit > 0 && found_banks.len() >= limit { break; }
+        off += (n.saturating_sub(64)) as u64;
+        let _ = f.seek(SeekFrom::Start(off));
+    }
+    println!("Found {} ADAT audio banks. Decoding...", found_banks.len());
+    let mut total_wavs = 0usize;
+    for (i, &(bank_off, sc, _)) in found_banks.iter().enumerate() {
+        let _ = f.seek(SeekFrom::Start(bank_off));
+        let mut bank_data = vec![0u8; 256 * 1024];
+        let n = f.read(&mut bank_data).unwrap_or(0);
+        bank_data.truncate(n);
+        let stem = format!("bank_{:03}_off_{:08x}_{}st", i, bank_off, sc);
+        let res = awc::decode_awc_bytes_to_wavs_detailed(&bank_data, out_dir, &stem);
+        total_wavs += res.wavs.len();
+        println!("  [{}/{}] Bank @ 0x{:08x} (sc={sc}): decoded {} WAVs ({})", i + 1, found_banks.len(), bank_off, res.wavs.len(), res.summary);
+    }
+    println!("DONE: Exported {} total WAV audio tracks to {}", total_wavs, out_dir.display());
+}
+
+fn decode_navmesh_cli(rpf_path: &Path, out_dir: &Path, sector_filter: Option<&str>, limit: usize) {
+    let _ = fs::create_dir_all(out_dir);
+    let sec_name = sector_filter.unwrap_or("all");
+    println!("Scanning CNavMesh tiles from {} for sector '{}'...", rpf_path.display(), sec_name);
+    
+    let mut tiles = Vec::new();
+    
+    // 1. Try loading from scan_cache_v9.tsv if available
+    if let Some(cache_p) = cache_file_path() {
+        if cache_p.exists() {
+            if let Ok(content) = fs::read_to_string(&cache_p) {
+                for line in content.lines() {
+                    if !line.contains("\tNAVM\t") { continue; }
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() < 8 { continue; }
+                    let tile_nm = parts[3];
+                    let off: u64 = if let Ok(o) = parts[5].parse() { o } else { continue };
+                    let polys: u32 = parts.get(8).and_then(|p| p.parse().ok()).unwrap_or(1152);
+                    
+                    // Parse coordinates: nav_266_247_(1280,-1152).ynv
+                    let mut matched = true;
+                    if let Some(sec) = sector_filter {
+                        let sec_lower = sec.to_lowercase();
+                        if let (Some(s_paren), Some(e_paren)) = (tile_nm.find('('), tile_nm.find(')')) {
+                            let coords = &tile_nm[s_paren+1..e_paren];
+                            let cparts: Vec<&str> = coords.split(',').collect();
+                            if cparts.len() == 2 {
+                                if let (Ok(wx), Ok(wy)) = (cparts[0].parse::<i32>(), cparts[1].parse::<i32>()) {
+                                    if sec_lower == "ocean_drive" || sec_lower == "south_beach" {
+                                        matched = wx >= 1200 && wx <= 2800 && wy >= -1200 && wy <= 400;
+                                    } else if sec_lower == "downtown" || sec_lower == "brickell" {
+                                        matched = wx >= -550 && wx <= 150 && wy >= -1450 && wy <= -650;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if matched {
+                        tiles.push((off, tile_nm.to_string(), polys));
+                        if limit > 0 && tiles.len() >= limit { break; }
+                    }
+                }
+            }
+        }
+    }
+    
+    // 2. Fallback to stream scanning if cache was empty
+    if tiles.is_empty() {
+        println!("Cache empty or not matched; running fallback stream scanner on {}...", rpf_path.display());
+        let mut f = match File::open(rpf_path) {
+            Ok(f) => f,
+            Err(e) => { eprintln!("Failed to open {}: {e}", rpf_path.display()); return; }
+        };
+        let base_search_off = 786_010_112u64;
+        let _ = f.seek(SeekFrom::Start(base_search_off));
+        let mut buf = vec![0u8; 32 * 1024 * 1024];
+        let n = f.read(&mut buf).unwrap_or(0);
+        let mut dec = Decompress::new(true);
+        let mut out = vec![0u8; 32768];
+        let mut pos = 0usize;
+        while pos + 32 <= n {
+            if buf[pos] == 0x78 && matches!(buf[pos + 1], 0x01 | 0x5e | 0x9c | 0xda) {
+                dec.reset(true);
+                let _ = dec.decompress(&buf[pos..(pos + 32768).min(n)], &mut out, FlushDecompress::None);
+                if dec.total_out() >= 0xD0 {
+                    let ver = u32::from_le_bytes([out[0x14], out[0x15], out[0x16], out[0x17]]);
+                    if ver == 0x0001_0015 {
+                        let midx = u32::from_le_bytes([out[0xC8], out[0xC9], out[0xCA], out[0xCB]]);
+                        let n_polys = u32::from_le_bytes([out[0xC4], out[0xC5], out[0xC6], out[0xC7]]);
+                        let abs_off = base_search_off + pos as u64;
+                        let nm = if midx < 512 * 512 {
+                            let gx = (midx % 512) as i32;
+                            let gy = (midx / 512) as i32;
+                            let wx = (gx - 256) * 128;
+                            let wy = (gy - 256) * 128;
+                            format!("nav_{gx:03}_{gy:03}_({wx},{wy})")
+                        } else {
+                            format!("nav_dyn_{midx:06x}")
+                        };
+                        tiles.push((abs_off, nm, n_polys));
+                        if limit > 0 && tiles.len() >= limit { break; }
+                    }
+                }
+            }
+            pos += 16;
+        }
+    }
+    
+    println!("Found {} CNavMesh tiles for sector '{}'. Decoding 3D meshes...", tiles.len(), sec_name);
+    let mut ok = 0usize;
+    let mut all_verts = Vec::new();
+    let mut all_tris = Vec::new();
+    let mut all_geom = Vec::new();
+    let mut class_counts = [0usize; 5]; // 0: Land, 1: Water, 2: Road, 3: Pavement, 4: Interior
+    
+    for (i, (off, name, _n_polys)) in tiles.iter().enumerate() {
+        match tex::decode_navmesh_from_rpf(rpf_path, *off, name) {
+            Ok(mesh) => {
+                let obj_p = out_dir.join(format!("{name}.obj"));
+                let _ = mesh.export_obj(&obj_p);
+                ok += 1;
+                
+                // Aggregate into sector mesh
+                let base_v = all_verts.len() as u32;
+                all_verts.extend_from_slice(&mesh.verts);
+                for tri in &mesh.tris {
+                    all_tris.push([tri[0] + base_v, tri[1] + base_v, tri[2] + base_v]);
+                }
+                for &mat in &mesh.tri_geom {
+                    let m = (mat as usize).min(4);
+                    class_counts[m] += 1;
+                    all_geom.push(mat);
+                }
+                
+                if (i + 1) % 15 == 0 || i + 1 == tiles.len() {
+                    println!("  [{}/{}] Decoded {} (accumulated verts: {}, tris: {})",
+                        i + 1, tiles.len(), name, all_verts.len(), all_tris.len());
+                }
+            }
+            Err(e) => eprintln!("  [{}/{}] {} error: {e}", i + 1, tiles.len(), name),
+        }
+    }
+    
+    println!("DONE: Exported {}/{} individual tile OBJs to {}", ok, tiles.len(), out_dir.display());
+    
+    // Assemble unified sector mesh
+    if !all_verts.is_empty() {
+        let assembled_name = format!("{sec_name}_cnavmesh_assembled");
+        let mut min_bound = [f32::MAX, f32::MAX, f32::MAX];
+        let mut max_bound = [f32::MIN, f32::MIN, f32::MIN];
+        for v in &all_verts {
+            for k in 0..3 {
+                if v[k] < min_bound[k] { min_bound[k] = v[k]; }
+                if v[k] > max_bound[k] { max_bound[k] = v[k]; }
+            }
+        }
+        
+        let poly_total = all_tris.len();
+        let assembled_mesh = Mesh3D::from_parts(
+            assembled_name.clone(),
+            all_verts,
+            Vec::new(),
+            all_tris,
+            all_geom,
+            Vec::new(),
+            None,
+            format!("Sector {} CNavMesh: {} triangles across {} tiles", sec_name, poly_total, ok),
+            5,
+            poly_total,
+            "NavMesh".into(),
+        );
+        
+        let assembled_obj = out_dir.join(format!("{assembled_name}.obj"));
+        if let Err(e) = assembled_mesh.export_obj(&assembled_obj) {
+            eprintln!("Warning: Failed to export assembled OBJ: {e}");
+        } else {
+            println!("  [Assembled OBJ] {}", assembled_obj.display());
+        }
+        
+        let assembled_glb = out_dir.join(format!("{assembled_name}.glb"));
+        if let Err(e) = assembled_mesh.export_glb(&assembled_glb) {
+            eprintln!("Warning: Failed to export assembled GLB: {e}");
+        } else {
+            println!("  [Assembled GLB] {}", assembled_glb.display());
+        }
+        
+        println!("\n=== SECTOR '{}' CNavMesh METRICS ===", sec_name);
+        println!("  Tiles Decoded:        {}", ok);
+        println!("  Total Vertices:       {}", assembled_mesh.verts.len());
+        println!("  Total Triangles:      {}", assembled_mesh.tris.len());
+        println!("  Class 0 (Land):       {} triangles", class_counts[0]);
+        println!("  Class 1 (Water):      {} triangles", class_counts[1]);
+        println!("  Class 2 (Road):       {} triangles", class_counts[2]);
+        println!("  Class 3 (Pavement):   {} triangles", class_counts[3]);
+        println!("  Class 4 (Interior):   {} triangles", class_counts[4]);
+        println!("  Bounding Box X:       [{:.1}m .. {:.1}m] (Width: {:.1}m)", min_bound[0], max_bound[0], max_bound[0] - min_bound[0]);
+        println!("  Bounding Box Y:       [{:.1}m .. {:.1}m] (Height: {:.1}m)", min_bound[1], max_bound[1], max_bound[1] - min_bound[1]);
+        println!("  Bounding Box Z:       [{:.1}m .. {:.1}m] (Altitude: {:.1}m)", min_bound[2], max_bound[2], max_bound[2] - min_bound[2]);
+        println!("====================================\n");
+    }
+}
+
+#[cfg(windows)]
+fn init_windows_console() {
+    unsafe {
+        use std::ffi::c_void;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn AllocConsole() -> i32;
+            fn AttachConsole(dwProcessId: u32) -> i32;
+            fn SetConsoleTitleW(lpConsoleTitle: *const u16) -> i32;
+            fn SetStdHandle(nStdHandle: u32, hHandle: *mut c_void) -> i32;
+            fn CreateFileW(
+                lpFileName: *const u16,
+                dwDesiredAccess: u32,
+                dwShareMode: u32,
+                lpSecurityAttributes: *mut c_void,
+                dwCreationDisposition: u32,
+                dwFlagsAndAttributes: u32,
+                hTemplateFile: *mut c_void,
+            ) -> *mut c_void;
+        }
+
+        // Try attaching to parent terminal first, otherwise allocate a dedicated console window
+        if AttachConsole(0xFFFF_FFFF) == 0 {
+            AllocConsole();
+        }
+
+        let title: Vec<u16> = "PercyStar Debug Console\0".encode_utf16().collect();
+        SetConsoleTitleW(title.as_ptr());
+
+        let conout_name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+        const GENERIC_READ_WRITE: u32 = 0xC000_0000;
+        const FILE_SHARE_READ_WRITE: u32 = 0x0000_0003;
+        const OPEN_EXISTING: u32 = 3;
+        const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+        const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
+
+        let conout = CreateFileW(
+            conout_name.as_ptr(),
+            GENERIC_READ_WRITE,
+            FILE_SHARE_READ_WRITE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+
+        if !conout.is_null() && conout != (-1isize as *mut c_void) {
+            SetStdHandle(STD_OUTPUT_HANDLE, conout);
+            SetStdHandle(STD_ERROR_HANDLE, conout);
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    #[cfg(windows)]
+    init_windows_console();
+    eprintln!("[PercyStar] Console and logging initialized.");
     // remove leftover old exe from previous self update
     if let Ok(cur) = std::env::current_exe() {
         let _ = fs::remove_file(cur.with_extension("exe.old"));
@@ -6396,14 +6621,105 @@ fn main() -> eframe::Result<()> {
         export_models_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), filt, false);
         return Ok(());
     }
+    if args.len() >= 2 && args[1] == "--assemble-map" {
+        let common_p = PathBuf::from(r"S:\gta\Gta6fordevelopersacces\common.rpf");
+        let levels_p = PathBuf::from(r"S:\gta\Gta6fordevelopersacces\levels.rpf");
+        let carved_p = PathBuf::from(r"C:\pulpit\xx\carved_data");
+        let out_glb = PathBuf::from(r"C:\pulpit\xx\full_world_map_assembled.glb");
+        let out_png = PathBuf::from(r"C:\pulpit\xx\full_world_map_preview.png");
+        match map_assembler::assemble_gta6_world_map(&common_p, &levels_p, &carved_p, &out_glb, &out_png) {
+            Ok(rep) => {
+                println!("=== GTA 6 Full World Map Assembled Successfully ===");
+                println!("Terrain: {} vertices, {} triangles", rep.terrain_vertices, rep.terrain_triangles);
+                println!("Brickell SLOD: {} geoms, {} vertices, {} triangles", rep.brickell_geometries, rep.brickell_vertices, rep.brickell_triangles);
+                println!("City Placements: {} locations, {} vertices, {} triangles", rep.city_placements_count, rep.city_vertices, rep.city_triangles);
+                println!("Total Scene: {} vertices, {} triangles", rep.total_vertices, rep.total_triangles);
+                println!("Exported GLB: {} ({} bytes)", rep.glb_path, rep.glb_bytes);
+                println!("Rendered PNG: {} ({} bytes)", rep.png_path, rep.png_bytes);
+            }
+            Err(e) => eprintln!("Assembly error: {e}"),
+        }
+        return Ok(());
+    }
+    if args.len() >= 2 && args[1] == "--verify-props" {
+        if let Err(e) = props_pipeline::verify_props_cli() {
+            eprintln!("Props pipeline error: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if args.len() >= 2 && args[1] == "--assemble-full-props-map" {
+        let common_p = PathBuf::from(r"S:\gta\Gta6fordevelopersacces\common.rpf");
+        let levels_p = PathBuf::from(r"S:\gta\Gta6fordevelopersacces\levels.rpf");
+        let carved_p = PathBuf::from(r"C:\pulpit\xx\carved_data");
+        let out_glb = PathBuf::from(r"C:\pulpit\xx\full_world_map_with_props.glb");
+        let out_png = PathBuf::from(r"C:\pulpit\xx\full_world_map_with_props_preview.png");
+        match map_assembler::assemble_full_world_map_with_props(&common_p, &levels_p, &carved_p, &out_glb, &out_png) {
+            Ok(rep) => {
+                println!("=== GTA 6 Full World Map With Props Assembled Successfully ===");
+                println!("Terrain: {} vertices, {} triangles", rep.terrain_vertices, rep.terrain_triangles);
+                println!("Brickell SLOD: {} geoms, {} vertices, {} triangles", rep.brickell_geometries, rep.brickell_vertices, rep.brickell_triangles);
+                println!("Unique LOD0 Props Decoded: {}", rep.unique_props_count);
+                println!("Placed Prop Instances: {} world nodes", rep.placed_props_count);
+                println!("Total Unique Scene Vertices: {}", rep.total_vertices);
+                println!("Total Unique Scene Triangles: {}", rep.total_triangles);
+                println!("Exported Instanced GLB: {} ({} bytes)", rep.glb_path, rep.glb_bytes);
+                println!("Rendered High-Res PNG: {} ({} bytes)", rep.png_path, rep.png_bytes);
+                println!("Assembly Elapsed Time: {:.2}s", rep.elapsed_secs);
+            }
+            Err(e) => eprintln!("Assembly error: {e}"),
+        }
+        return Ok(());
+    }
+    if args.len() >= 2 && args[1] == "--assemble-all-sectors" {
+        let out_dir = args.get(2)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\pulpit\xx\full_world_sectors"));
+        let common_p = PathBuf::from(r"S:\gta\Gta6fordevelopersacces\common.rpf");
+        let levels_p = PathBuf::from(r"S:\gta\Gta6fordevelopersacces\levels.rpf");
+        let carved_p = PathBuf::from(r"C:\pulpit\xx\carved_data");
+        match map_assembler::assemble_all_world_sectors(&common_p, &levels_p, &carved_p, &out_dir) {
+            Ok(rep) => {
+                println!("=== GTA 6 Full World Sectors Assembly Complete ===");
+                println!("Output Directory:          {}", out_dir.display());
+                println!("Total Non-Empty Sectors:   {}", rep.total_sectors);
+                println!("Base Terrain Mesh:         {} vertices, {} triangles", rep.terrain_vertices, rep.terrain_triangles);
+                println!("Unique Models Decoded:     {}", rep.total_unique_models);
+                println!("Total Placed Instances:    {} world nodes", rep.total_placed_instances);
+                println!("Total Unique Vertices:     {}", rep.total_vertices);
+                println!("Total Unique Triangles:    {}", rep.total_triangles);
+                println!("Total Sectors Output Size: {} bytes ({:.2} MB)", rep.total_directory_bytes, rep.total_directory_bytes as f64 / 1_048_576.0);
+                println!("Blender Loader Script:     {}", out_dir.join("load_full_world_in_blender.py").display());
+                println!("Sectors Manifest:          {}", out_dir.join("sectors_manifest.json").display());
+                println!("Assembly Elapsed Time:     {:.2}s", rep.elapsed_secs);
+            }
+            Err(e) => {
+                eprintln!("Assembly error: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+    if args.len() >= 2 && args[1] == "--render-street-lod0" {
+        let levels_p = PathBuf::from(r"S:\gta\Gta6fordevelopersacces\levels.rpf");
+        let out_dir = args.get(2)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\pulpit\xx\street_level_renders"));
+        if let Err(e) = map_assembler::render_street_level_lod0_cli(&levels_p, &out_dir) {
+            eprintln!("Street render error: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.len() >= 4 && args[1] == "--decode-audio" {
         let lim = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
         decode_audio_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
         return Ok(());
     }
     if args.len() >= 4 && args[1] == "--decode-navmesh" {
-        let lim = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-        decode_navmesh_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
+        let sector = args.get(4).map(|s| s.as_str());
+        let lim = args.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        decode_navmesh_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), sector, lim);
         return Ok(());
     }
 
@@ -6637,6 +6953,11 @@ mod tests {
             let joined = out.join(&name);
             assert_eq!(joined.parent(), Some(out), "{bad:?} -> {name:?}");
             assert!(!name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', ':']), "{bad:?} -> {name:?}");
+        }
+        // windows device names stay files even when an extension follows
+        for dev in ["CON", "con.txt", "Nul.png", "COM1", "lpt9.tar.gz", "aux"] {
+            let name = safe_file_name(dev);
+            assert!(name.split('.').next().is_some_and(|stem| stem.ends_with('_')), "{dev:?} -> {name:?}");
         }
         // ordinary archive names are untouched
         for ok in ["banshee_hi.ft", "nav_256_256_(0,0).ynv", "cheetah2.#ft", "a b-c_d.png"] {
@@ -6963,7 +7284,12 @@ mod tests {
 
     #[test]
     fn real_gta6_archives_smoke_test() {
-        let base = Path::new(r"D:\Grand Theft Auto VI Build");
+        let base_p = PathBuf::from(r"S:\gta\Gta6fordevelopersacces");
+        let base = if base_p.exists() {
+            &base_p
+        } else {
+            Path::new(r"D:\Grand Theft Auto VI Build")
+        };
         if !base.exists() { return; }
 
         // 1. TTPF native scan + decode

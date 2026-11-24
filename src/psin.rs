@@ -815,4 +815,13 @@ mod tests {
         let csv = doc.export_placements_csv(None, false);
         assert!(csv.contains("0xdeadbeef,,10.0000,20.0000,30.0000"));
     }
+
+    #[test]
+    fn parses_carved_gta6_psin() {
+        let p = std::path::Path::new(r"C:\pulpit\xx\carved_data\0x0000021000_binary.bin");
+        if !p.exists() { return; }
+        let data = std::fs::read(p).unwrap();
+        let txt = parse_psin(&data);
+        eprintln!("Carved PSIN dump (first 500 chars):\n{}", &txt[..txt.len().min(500)]);
+    }
 }

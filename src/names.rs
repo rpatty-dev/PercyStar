@@ -65,16 +65,30 @@ pub fn is_built(hash: u32) -> bool {
 }
 
 // adds assembled names, ones already known from elsewhere keep their standing
-pub fn add_built<I, S>(names: I)
+// returns how many were new; the check and the insert share one lock so the count
+// stays correct while other threads (or parallel tests) add names at the same time
+pub fn add_built<I, S>(names: I) -> usize
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let fresh: Vec<String> = names.into_iter().map(|n| n.as_ref().trim().to_string()).filter(|n| is_name(n) && lookup(joaat_cs(n)).is_none()).collect();
-    add(fresh.iter());
-    if let Ok(mut d) = dict().write() {
-        d.built.extend(fresh.iter().map(|n| joaat_cs(n)));
+    let Ok(mut d) = dict().write() else { return 0 };
+    let mut added = 0;
+    for n in names {
+        let n = n.as_ref().trim();
+        if !is_name(n) {
+            continue;
+        }
+        let hash = joaat_cs(n);
+        if d.exact.contains_key(&hash) || d.lower.contains_key(&crate::psin::joaat(n)) {
+            continue;
+        }
+        d.exact.insert(hash, n.to_string());
+        d.lower.entry(crate::psin::joaat(n)).or_insert_with(|| n.to_string());
+        d.built.insert(hash);
+        added += 1;
     }
+    added
 }
 
 pub fn len() -> usize {
@@ -127,7 +141,7 @@ pub fn load_dir(dir: &Path) -> usize {
         let Ok(text) = std::fs::read_to_string(&p) else { continue };
         if ext.as_deref() == Some(std::ffi::OsStr::new("txt")) {
             if p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(BUILT_FILE)) {
-                add_built(text.lines());
+                added += add_built(text.lines());
             } else {
                 added += add(text.lines());
             }
@@ -147,10 +161,7 @@ fn load_table(text: &str) -> usize {
         let method = cols.nth(1).unwrap_or("");
         if matches!(method.trim(), "name list" | "game text" | "") { sure.push(name) } else { built.push(name) }
     }
-    let added = add(sure.iter());
-    let before = len();
-    add_built(built.iter());
-    added + len().saturating_sub(before)
+    add(sure.iter()) + add_built(built.iter())
 }
 
 // merges names into one of the folder's lists

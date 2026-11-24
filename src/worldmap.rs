@@ -138,20 +138,16 @@ impl WorldMapData {
 
     fn height_pixel_for_map_uv(&self, uv: egui::Pos2) -> (usize, usize) {
         let u = uv.x.clamp(0.0, 1.0);
-        let texture_v = 1.0 - uv.y.clamp(0.0, 1.0);
+        let texture_v = uv.y.clamp(0.0, 1.0);
         (
             ((u * self.w as f32) as usize).min(self.w - 1),
             ((texture_v * self.h as f32) as usize).min(self.h - 1),
         )
     }
 
-    // Build terrain in game units, using upstream's small ground offset.
+    // Build terrain in game units, matching true world elevation.
     pub fn build_world_terrain_mesh(&self, step: usize) -> Mesh3D {
         let mut m = self.build_terrain_mesh_with_tex(step, 2048, 1.0);
-        for v in &mut m.verts {
-            v[2] -= 1.0;
-        }
-        m.center[2] -= 1.0;
         m.name = "mhiu_world_terrain".into();
         m
     }
@@ -169,7 +165,7 @@ impl WorldMapData {
         let mut uvs = Vec::with_capacity(gw * gh);
         for gy in 0..gh {
             let py = (gy * step).min(self.h - 1);
-            let wy = self.bmin[1] + (1.0 - py as f32 / self.h as f32) * (self.bmax[1] - self.bmin[1]);
+            let wy = self.bmin[1] + (py as f32 / self.h as f32) * (self.bmax[1] - self.bmin[1]);
             for gx in 0..gw {
                 let px = (gx * step).min(self.w - 1);
                 let wx = self.bmin[0] + (px as f32 / self.w as f32) * (self.bmax[0] - self.bmin[0]);
@@ -538,8 +534,8 @@ mod tests {
         assert_eq!(map_texture_uv_rect().left_top(), egui::pos2(0.0, 1.0));
         assert_eq!(map_texture_uv_rect().right_bottom(), egui::pos2(1.0, 0.0));
         for (uv, world, pixel, height) in [
-            (egui::pos2(0.0, 0.0), [-100.0, -200.0], (0, 7), 170.0),
-            (egui::pos2(1.0, 1.0), [700.0, 600.0], (7, 0), 30.0),
+            (egui::pos2(0.0, 0.0), [-100.0, -200.0], (0, 0), 30.0),
+            (egui::pos2(1.0, 1.0), [700.0, 600.0], (7, 7), 170.0),
         ] {
             assert_eq!(map.world_for_map_uv(uv), world);
             assert_eq!(map.map_uv_for_world(world[0], world[1]), uv);
@@ -562,7 +558,7 @@ mod tests {
         assert!((world[0] - 114.0).abs() < 0.001);
         assert!((world[1] - 14.0).abs() < 0.001);
         let (px, py) = map.height_pixel_for_map_uv(uv);
-        assert!((map.elevation_m(px, py) - 130.0).abs() < 0.001);
+        assert!((map.elevation_m(px, py) - 70.0).abs() < 0.001);
     }
 
     #[test]
@@ -577,11 +573,11 @@ mod tests {
         let run = preview.verts[1][0] - preview.verts[0][0];
         let rise = preview.verts[1][2] - preview.verts[0][2];
         assert!((rise / run - 0.25).abs() < 0.001, "100m rise over 400m must retain its slope");
-        assert!((world.verts[1][2] - 99.0).abs() < 0.001);
+        assert!((world.verts[1][2] - 100.0).abs() < 0.001);
         for (p, w) in preview.verts.iter().zip(&world.verts) {
             assert!((p[0] * 100.0 - w[0]).abs() < 0.001);
             assert!((p[1] * 100.0 - w[1]).abs() < 0.001);
-            assert!((p[2] * 100.0 - 1.0 - w[2]).abs() < 0.001);
+            assert!((p[2] * 100.0 - w[2]).abs() < 0.001);
         }
         for (p, w) in preview.normals.iter().zip(&world.normals) {
             assert!(p.iter().zip(w).map(|(a, b)| a * b).sum::<f32>() > 0.9999);
@@ -610,8 +606,8 @@ mod tests {
         let world = d.build_world_terrain_mesh(4);
         assert_eq!(world.name, "mhiu_world_terrain");
         assert_eq!(world.verts[0][0], -1000.0);
-        assert_eq!(world.verts[0][1], 1000.0);
-        assert_eq!(world.verts[0][2], d.elevation_m(0, 0).max(0.0) - 1.0);
+        assert_eq!(world.verts[0][1], -1000.0);
+        assert_eq!(world.verts[0][2], d.elevation_m(0, 0).max(0.0));
         assert_eq!(parse_nav_coords("nav_256_256_(0,0).ynv"), Some((0.0, 0.0)));
     }
 }

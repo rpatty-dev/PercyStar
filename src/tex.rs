@@ -1054,6 +1054,16 @@ pub fn ttpf_read_virtual(path: &Path, ix: &TtpfIndex, off: u64, len: usize) -> R
                     ch
                 } else if codec == 1 && vl % 8 == 0 && vl <= MAX_BCPACK_CHUNK {
                     bcpack_bc1_chunk(&ch, vl)?
+                } else if codec == 3 && vl % 16 == 0 && vl <= MAX_BCPACK_CHUNK {
+                    crate::bcpack_rans::decode_bc3_chunk(&ch, vl)?
+                } else if codec == 4 && vl % 8 == 0 && vl <= MAX_BCPACK_CHUNK {
+                    crate::bcpack_rans::decode_bc4_chunk(&ch, vl)?
+                } else if codec == 5 && vl % 16 == 0 && vl <= MAX_BCPACK_CHUNK {
+                    crate::bcpack_rans::decode_bc5_chunk(&ch, vl)?
+                } else if codec == 6 && vl % 16 == 0 && vl <= MAX_BCPACK_CHUNK {
+                    crate::bcpack_rans::decode_bc6h_chunk(&ch, vl)?
+                } else if codec == 7 && vl % 16 == 0 && vl <= MAX_BCPACK_CHUNK {
+                    crate::bcpack_rans::decode_bc7_chunk(&ch, vl)?
                 } else {
                     let mode = match codec {
                         1 => "BC1", 2 => "BC2", 3 => "BC3", 4 => "BC4", 5 => "BC5", 6 => "BC6H", 7 => "BC7", _ => "HW",
@@ -1675,6 +1685,14 @@ pub fn decode_0drpz_text(data: &[u8]) -> Option<String> {
 // =============================================================================
 
 pub fn decode_navmesh_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &str) -> Result<Mesh3D, String> {
+    decode_navmesh_from_rpf_opt(rpf_path, file_off, fallback_name, false)
+}
+
+pub fn decode_navmesh_roads_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &str) -> Result<Mesh3D, String> {
+    decode_navmesh_from_rpf_opt(rpf_path, file_off, fallback_name, true)
+}
+
+pub fn decode_navmesh_from_rpf_opt(rpf_path: &Path, file_off: u64, fallback_name: &str, roads_only: bool) -> Result<Mesh3D, String> {
     let mut f = File::open(rpf_path).map_err(|e| format!("Open error: {e}"))?;
     let (v, _) = read_rage9_vp(&mut f, file_off)?;
     if v.len() < 0xD0 || ru32(&v, 0x14) != 0x0001_0015 {
@@ -1754,6 +1772,9 @@ pub fn decode_navmesh_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &s
             } else {
                 0
             };
+            if roads_only && mat != 2 && mat != 3 {
+                continue;
+            }
             let i0 = indices[first];
             for k in 1..nv - 1 {
                 let (i1, i2) = (indices[first + k], indices[first + k + 1]);
@@ -1768,18 +1789,29 @@ pub fn decode_navmesh_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &s
     if verts.is_empty() || tris.is_empty() {
         return Err("Empty CNavMesh geometry".into());
     }
+    if roads_only {
+        for v in &mut verts {
+            v[2] += 0.22;
+        }
+    }
+    let uvs = verts.iter().map(|v| [v[0] * 0.25, v[1] * 0.25]).collect();
+    let label = if roads_only {
+        format!("CNavMesh Road Network ({poly_cnt} polys, Z {:.1}..{:.1}m)", min_v[2], min_v[2] + ext[2])
+    } else {
+        format!("CNavMesh ({poly_cnt} polys, Z {:.0}..{:.0}m)", min_v[2], min_v[2] + ext[2])
+    };
     Ok(Mesh3D::from_parts(
         fallback_name.to_string(),
         verts,
-        Vec::new(),
+        uvs,
         tris,
         tri_geom,
         Vec::new(),
         None,
-        format!("CNavMesh ({poly_cnt} polys, Z {:.0}..{:.0}m)", min_v[2], min_v[2] + ext[2]),
+        label,
         5,
         poly_cnt,
-        "NavMesh".into(),
+        if roads_only { "Road".into() } else { "NavMesh".into() },
     ))
 }
 

@@ -523,8 +523,7 @@ fn draw_line_z(color_buf: &mut [Color32], z_buf: &mut [f32], w: usize, h: usize,
 }
 
 // renders the mesh into its color and depth buffers at w by h samples
-#[cfg(test)]
-pub(super) fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
+pub fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
     rasterize(mesh, w, h, 1);
 }
 

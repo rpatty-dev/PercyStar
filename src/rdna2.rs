@@ -71,6 +71,7 @@ pub struct Ps09ShaderEntry {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct Ps09Header {
     pub id: String,
     pub driver: String,
@@ -441,6 +442,7 @@ pub struct DecodedInsn {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum InsnKind {
     EndPgm,
     CodeEnd,

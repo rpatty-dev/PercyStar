@@ -14,8 +14,7 @@ mod vertex_stream;
 
 pub use shading::NormalSource;
 pub use texture::Texture2D;
-#[cfg(test)]
-use raster::rasterize_mesh;
+pub use raster::rasterize_mesh;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShadeMode {
@@ -441,6 +440,16 @@ impl Mesh3D {
         self.pan_x = 0.0;
         self.pan_y = 0.0;
         self.dirty = true;
+    }
+
+    pub fn render_preview_image(&mut self, w: usize, h: usize, path: &Path) -> Result<(), String> {
+        rasterize_mesh(self, w, h);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for c in &self.color_buf {
+            rgba.extend_from_slice(&c.to_srgba_unmultiplied());
+        }
+        image::save_buffer(path, &rgba, w as u32, h as u32, image::ColorType::Rgba8)
+            .map_err(|e| format!("Failed to save preview image {}: {e}", path.display()))
     }
 
     // Adds an independently stored vehicle option at the same model-space
@@ -1583,8 +1592,16 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
     decode_rage9_model_from_rpf_lod(rpf_path, file_off, fallback_name, 0)
 }
 
+pub fn decode_rage9_model_from_rpf_opt(rpf_path: &Path, file_off: u64, fallback_name: &str, layout_grid: bool) -> Result<Mesh3D, String> {
+    decode_rage9_model_from_rpf_lod_opt(rpf_path, file_off, fallback_name, 0, layout_grid)
+}
+
 // decodes one lod level 0 high to 3 vlow falls back to the nearest populated level
 pub fn decode_rage9_model_from_rpf_lod(rpf_path: &Path, file_off: u64, fallback_name: &str, want_lod: usize) -> Result<Mesh3D, String> {
+    decode_rage9_model_from_rpf_lod_opt(rpf_path, file_off, fallback_name, want_lod, true)
+}
+
+pub fn decode_rage9_model_from_rpf_lod_opt(rpf_path: &Path, file_off: u64, fallback_name: &str, want_lod: usize, layout_grid: bool) -> Result<Mesh3D, String> {
     let mut f = File::open(rpf_path).map_err(|e| format!("Open error: {e}"))?;
     let (v, mut next_off, p_cnt) = read_virtual_from_file(&mut f, file_off)?;
 
@@ -1693,7 +1710,9 @@ pub fn decode_rage9_model_from_rpf_lod(rpf_path: &Path, file_off: u64, fallback_
     if b.verts.is_empty() {
         return Err("Decoded 0 vertices from meshlets".into());
     }
-    layout_parts_in_grid(&mut b.verts, &part_verts);
+    if layout_grid {
+        layout_parts_in_grid(&mut b.verts, &part_verts);
+    }
 
     // Optional vehicle fragments are often too small to pass the whole-vehicle
     // classifier but can still carry their own siren emitter bones.
