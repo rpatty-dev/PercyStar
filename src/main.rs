@@ -6200,7 +6200,8 @@ fn decode_audio_cli(rpf_path: &Path, out_dir: &Path, limit: usize) {
             if &buf[pos..pos + 4] == b"ADAT" {
                 let sc = u32::from_le_bytes([buf[pos + 8], buf[pos + 9], buf[pos + 10], buf[pos + 11]]);
                 let hdr_sz = u32::from_le_bytes([buf[pos + 12], buf[pos + 13], buf[pos + 14], buf[pos + 15]]);
-                if (1..=256).contains(&sc) && (16..=65536).contains(&hdr_sz) {
+                // Both ADAT stream table layouts use at least two bytes per stream.
+                if sc > 0 && (16..=65536).contains(&hdr_sz) && sc <= (hdr_sz - 16) / 2 {
                     banks.push((off + pos as u64, sc));
                     if limit > 0 && banks.len() >= limit { break; }
                 }
